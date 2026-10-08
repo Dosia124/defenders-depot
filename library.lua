@@ -1,48 +1,31 @@
 --[[
     ============================================================
-    PLACEMENT MAP BUILDER v5 — LIBRARY EDITION
+    PLACEMENT MAP BUILDER v5.1 — LIBRARY EDITION
     ============================================================
     Load with loadstring. The file RETURNS an API table:
 
         local PMB = loadstring(game:HttpGet("YOUR_RAW_URL_HERE"))()
 
     ► EDIT MODE (no arguments):
-        PMB()                -- opens the builder, draw zones in the world
+        PMB()
 
-    ► INSTRUCTION MODE (step-by-step playback):
+    ► INSTRUCTION MODE (playback):
         PMB({
-            autoPlay      = false,   -- start playing immediately
-            stepTime      = 5,       -- seconds per step (auto-play)
-            camFollow     = true,    -- camera flies to each step
-            showAllLabels = true,    -- show every billboard text
-            loop          = true,    -- auto-play wraps around
-            append        = false,   -- true = keep existing steps
-
-            -- EITHER raw exported text:
-            data = "# PLACEMENT MAP\n[Step 1]\ntext = Sniper here\n...",
-
-            -- OR a clean table:
-            steps = {
-                { name = "Step 1", text = "Sniper here",
-                  position = Vector3.new(12.5, 0, -30), -- or {12.5, 0, -30} or "12.5, 0, -30"
-                  size = {8, 6}, rotation = 45,
-                  color = {86, 214, 145},               -- or "56D691" or Color3
-                  visible = true },
-            },
+            autoPlay = false, stepTime = 5, camFollow = true,
+            showAllLabels = true, loop = true, append = false,
+            data = "exported map text",       -- OR:
+            steps = { { text = "Sniper here", position = {10,0,-20},
+                        size = {6,6}, rotation = 45, color = {86,214,145} } },
         })
-
-        -- a plain string works too:
-        PMB("exported map text")
+        PMB("exported map text")   -- raw string also works
 
     ► PROGRAMMATIC:
-        PMB:Edit()      -- force edit mode
-        PMB:Play(cfg)   -- force playback
-        PMB:Preview()   -- playback of the steps you built in edit mode
-        PMB:Destroy()   -- full cleanup
+        PMB:Edit()  PMB:Play(cfg)  PMB:Preview()  PMB:Destroy()
+        PMB:RebuildMenu()
 
-    Hotkeys (playback):  ← → or [ ] navigate • Space = auto-play • H = hide visuals
-    Hotkeys (edit):      drag = create/move • handles = resize • ring = rotate
-                         [ ] steps • Del = delete • Esc = cancel • H = hide
+    Hotkeys (playback): ← → or [ ] navigate • Space = auto-play • H = hide visuals
+    Hotkeys (edit):     drag = create/move • handles = resize • ring = rotate (45° snap)
+                        [ ] steps • Del = delete • Esc = cancel • H = hide
     ============================================================
 ]]
 
@@ -54,22 +37,22 @@ local Workspace = game:GetService("Workspace")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
--- double-load guard: destroy the previous instance if re-executed
+local FLUENT_URL = "https://github.com/StyearX/Fluent-Modded/releases/download/1.6.0/main.lua"
+
 local GBridge = (typeof(getgenv) == "function") and getgenv() or _G
 if GBridge.__PMB and type(GBridge.__PMB.Destroy) == "function" then
     pcall(GBridge.__PMB.Destroy)
-    GBridge.__PMB = nil
 end
 
 local API = {}
 
 -- ============================================================
---  НАСТРОЙКИ / CONFIG
+--  CONFIG
 -- ============================================================
 
 local CONFIG = {
     GridSnap = 1,
-    AngleSnapDeg = 5,
+    AngleSnapDeg = 45,         -- default rotation snap (was 5) — Settings slider can lower it
     MinSize = 1,
     DefaultSize = 4,
     ZoneThickness = 0.2,
@@ -85,6 +68,7 @@ local CONFIG = {
     BadgeSize = 34,
 
     GizmoOffset = 2,
+    RotRingSize = 3,           -- fixed-size rotation ring, does NOT scale with the zone
     MaxRayDistance = 2000,
 }
 
@@ -116,7 +100,7 @@ local FACE_AXIS = {
 }
 
 -- ============================================================
---  СОСТОЯНИЕ / STATE
+--  STATE
 -- ============================================================
 
 local playback = {
@@ -127,7 +111,6 @@ local playback = {
     showAllLabels = true,
     loop = true,
     thread = nil,
-    config = nil,
 }
 
 local Steps = {}
@@ -149,17 +132,31 @@ local gizmoDragging = false
 local hoveredStep = nil
 local editorHidden = false
 
--- forward declarations
-local refreshUI, selectStep, setEditorHidden, refreshPlaybackUI, focusCameraOnStep
-local notify
 local Fluent, Window, Tabs
 local statusPara, playbackPara, labelInput, stepDropdown
 local autoplayToggle, camFollowToggle, labelsToggle, visibilityToggle, hiddenToggle
-local dataGui, dataBox, dataStatus, hudGui
+local dataGui, dataBox, dataStatus, hudGui, hudTitle, hudBody
+local fbRefs = {}
+
+local labelSyncing, dropdownSyncing, autoSyncing, hiddenSyncing = false, false, false, false
+local menuStats = { elements = 0, errors = {} }
+
+-- forward declarations
+local refreshUI, selectStep, setEditorHidden, refreshPlaybackUI, focusCameraOnStep, teleportToCurrentStep
+local buildFallbackPanel, buildMenu, destroyMenu
+local createStep, duplicateStep, clearGizmos, applyColor, startPlayback, setAutoPlaying, exitPlayback
 
 -- ============================================================
---  УТИЛИТЫ / UTILITIES
+--  UTILITIES
 -- ============================================================
+
+local function notify(title, content, dur)
+    if Fluent and type(Fluent) == "table" then
+        pcall(function()
+            Fluent:Notify({ Title = title, Content = content, Duration = dur or 4 })
+        end)
+    end
+end
 
 local function snap(value, increment)
     if not increment or increment <= 0 then return value end
@@ -236,7 +233,7 @@ local function raycastZone()
 end
 
 -- ============================================================
---  ВИЗУАЛЫ: уголки + метка
+--  VISUALS
 -- ============================================================
 
 local function createBorder(part, color)
@@ -371,7 +368,7 @@ local function createBillboard(position, text, color, parent)
 end
 
 -- ============================================================
---  ТРАНСФОРМ / ВЫДЕЛЕНИЕ / ЦВЕТ
+--  TRANSFORM / SELECTION / COLOR
 -- ============================================================
 
 local function applyTransform(step)
@@ -383,6 +380,12 @@ local function applyTransform(step)
     if step.GizmoPart then
         step.GizmoPart.Size = part.Size
         step.GizmoPart.CFrame = part.CFrame * CFrame.new(0, CONFIG.GizmoOffset, 0)
+    end
+
+    -- fixed-size rotation ring stays centered above the zone
+    if step.RotAnchor then
+        step.RotAnchor.CFrame = CFrame.new(step.Center + Vector3.new(0, CONFIG.GizmoOffset, 0))
+            * CFrame.Angles(0, step.RotationY, 0)
     end
 
     if step.BB then
@@ -432,7 +435,7 @@ local function updateSelectionVisuals()
     end
 end
 
-local function applyColor(step, color)
+applyColor = function(step, color)
     step.Color = color
     if step.Part then step.Part.Color = color end
     if step.Border then step.Border.SetColor(color) end
@@ -449,7 +452,7 @@ local function applyColor(step, color)
 end
 
 -- ============================================================
---  КАМЕРА / ТЕЛЕПОРТ
+--  CAMERA
 -- ============================================================
 
 focusCameraOnStep = function(step, instant)
@@ -469,7 +472,7 @@ focusCameraOnStep = function(step, instant)
     TweenService:Create(cam, TweenInfo.new(0.9, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), { CFrame = target }):Play()
 end
 
-local function teleportToCurrentStep()
+teleportToCurrentStep = function()
     local step = getCurrentStep()
     if not (step and step.Center) then return end
     local char = player.Character
@@ -481,7 +484,7 @@ local function teleportToCurrentStep()
 end
 
 -- ============================================================
---  ПРЕВЬЮ ПРИ СОЗДАНИИ
+--  CREATE PREVIEW
 -- ============================================================
 
 local previewPart, previewHighlight, previewBorder, previewLabel
@@ -557,10 +560,10 @@ local function updatePreview(a, b, color)
 end
 
 -- ============================================================
---  ГИЗМО
+--  GIZMOS
 -- ============================================================
 
-local function clearGizmos(step)
+clearGizmos = function(step)
     if step.Handles then
         step.Handles:Destroy()
         step.Handles = nil
@@ -573,6 +576,10 @@ local function clearGizmos(step)
         step.GizmoPart:Destroy()
         step.GizmoPart = nil
     end
+    if step.RotAnchor then
+        step.RotAnchor:Destroy()
+        step.RotAnchor = nil
+    end
 end
 
 local function cancelPointerActions()
@@ -584,8 +591,9 @@ end
 
 local function showGizmos(step)
     if not step.Part or not step.Visible or step.Handles then return end
-    if playback.active then return end -- no editing handles during playback
+    if playback.active then return end
 
+    -- resize plate: matches the zone, handles sit at its edges
     local gizmoPart = Instance.new("Part")
     gizmoPart.Name = "GizmoAnchor"
     gizmoPart.Size = step.Part.Size
@@ -597,6 +605,19 @@ local function showGizmos(step)
     gizmoPart.Transparency = 1
     gizmoPart.Parent = step.Folder
     step.GizmoPart = gizmoPart
+
+    -- separate small anchor for the rotation ring so huge zones stay rotatable
+    local rotAnchor = Instance.new("Part")
+    rotAnchor.Name = "RotAnchor"
+    rotAnchor.Size = Vector3.new(CONFIG.RotRingSize, 0.1, CONFIG.RotRingSize)
+    rotAnchor.CFrame = CFrame.new(step.Center + Vector3.new(0, CONFIG.GizmoOffset, 0))
+    rotAnchor.Anchored = true
+    rotAnchor.CanCollide = false
+    rotAnchor.CanQuery = false
+    rotAnchor.CanTouch = false
+    rotAnchor.Transparency = 1
+    rotAnchor.Parent = step.Folder
+    step.RotAnchor = rotAnchor
 
     local handles = Instance.new("Handles")
     handles.Adornee = gizmoPart
@@ -640,7 +661,7 @@ local function showGizmos(step)
     end)
 
     local arc = Instance.new("ArcHandles")
-    arc.Adornee = gizmoPart
+    arc.Adornee = rotAnchor
     arc.Axes = Axes.new(Enum.Axis.Y)
     arc.Color3 = step.Color
     arc.Parent = playerGui
@@ -675,7 +696,7 @@ local function showGizmos(step)
 end
 
 -- ============================================================
---  ЗОНА
+--  ZONES
 -- ============================================================
 
 local function createZonePart(step)
@@ -728,10 +749,10 @@ local function destroyZone(step)
 end
 
 -- ============================================================
---  ШАГИ / STEPS
+--  STEPS
 -- ============================================================
 
-local function createStep(name, color, text)
+createStep = function(name, color, text)
     local id = nextStepId
     nextStepId += 1
     name = name or ("Step " .. id)
@@ -754,6 +775,7 @@ local function createStep(name, color, text)
         Handles = nil,
         ArcHandles = nil,
         GizmoPart = nil,
+        RotAnchor = nil,
         BB = nil,
     }
 
@@ -780,7 +802,7 @@ local function removeStepAt(index)
     table.remove(Steps, index)
 end
 
-local function duplicateStep(index)
+duplicateStep = function(index)
     local src = Steps[index]
     if not src then return nil end
     local step = createStep(src.Name .. " copy", src.Color, src.BillboardText)
@@ -825,7 +847,7 @@ selectStep = function(index)
 end
 
 -- ============================================================
---  ЭКСПОРТ / ИМПОРТ
+--  EXPORT / IMPORT
 -- ============================================================
 
 local function fmt(n)
@@ -892,7 +914,6 @@ local function parseBool(str)
     return nil
 end
 
--- tolerant converters for the config-table API
 local function toColor3(c)
     if typeof(c) == "Color3" then return c end
     if type(c) == "string" then return parseColor(c) end
@@ -910,6 +931,7 @@ end
 
 local function toVector3(v)
     if typeof(v) == "Vector3" then return v end
+    if typeof(v) == "Vector2" then return Vector3.new(v.X, 0, v.Y) end
     if type(v) == "table" then
         local x = v.X or v.x or v[1]
         local y = v.Y or v.y or v[2] or 0
@@ -935,7 +957,7 @@ local function parseMap(text)
         local c1, c2 = line:sub(1, 1), line:sub(1, 2)
 
         if line == "" or c1 == "#" or c2 == "--" or c2 == "//" then
-            -- skip
+            -- comment
         else
             local section = line:match("^%[(.-)%]$")
             if section then
@@ -1028,7 +1050,6 @@ local function importData(text)
     return true, msg
 end
 
--- build steps from a clean Lua table (instruction API)
 local function buildFromStepTable(list)
     for _, e in ipairs(list) do
         local name = e.name or e.title
@@ -1039,7 +1060,9 @@ local function buildFromStepTable(list)
         local pos = toVector3(e.position or e.pos or e.center)
         if pos then
             local size = e.size
-            if type(size) == "table" then
+            if typeof(size) == "Vector2" then
+                step.Width, step.Length = size.X, size.Y
+            elseif type(size) == "table" then
                 step.Width = math.max(tonumber(size[1] or size.Width or size.x) or CONFIG.DefaultSize, CONFIG.MinSize)
                 step.Length = math.max(tonumber(size[2] or size.Length or size.z or size[1]) or CONFIG.DefaultSize, CONFIG.MinSize)
             elseif type(size) == "number" then
@@ -1058,10 +1081,10 @@ local function buildFromStepTable(list)
 end
 
 -- ============================================================
---  РЕЖИН ИНСТРУКЦИЙ / PLAYBACK ENGINE
+--  PLAYBACK ENGINE
 -- ============================================================
 
-local function setAutoPlaying(on)
+setAutoPlaying = function(on)
     playback.autoPlaying = on
     if playback.thread then
         pcall(task.cancel, playback.thread)
@@ -1079,9 +1102,11 @@ local function setAutoPlaying(on)
                     if playback.loop == false then
                         playback.autoPlaying = false
                         playback.thread = nil
-                        pcall(function()
-                            if autoplayToggle and autoplayToggle.Set then autoplayToggle:Set(false) end
-                        end)
+                        if autoplayToggle and autoplayToggle.Set then
+                            autoSyncing = true
+                            pcall(function() autoplayToggle:Set(false) end)
+                            autoSyncing = false
+                        end
                         refreshPlaybackUI()
                         return
                     end
@@ -1096,12 +1121,11 @@ local function setAutoPlaying(on)
     end
 end
 
-local function startPlayback(config)
+startPlayback = function(config)
     config = config or {}
     setAutoPlaying(false)
 
     playback.active = true
-    playback.config = config
     playback.stepTime = tonumber(config.stepTime) or 5
     playback.camFollow = config.camFollow ~= false
     playback.showAllLabels = config.showAllLabels ~= false
@@ -1120,18 +1144,23 @@ local function startPlayback(config)
         end
     end
 
-    -- sync UI
-    pcall(function() if autoplayToggle and autoplayToggle.Set then autoplayToggle:Set(config.autoPlay == true) end end)
-    pcall(function() if camFollowToggle and camFollowToggle.Set then camFollowToggle:Set(playback.camFollow) end end)
-    pcall(function() if labelsToggle and labelsToggle.Set then labelsToggle:Set(playback.showAllLabels) end end)
+    autoSyncing = true
+    if autoplayToggle and autoplayToggle.Set then
+        pcall(function() autoplayToggle:Set(config.autoPlay == true) end)
+    end
+    autoSyncing = false
+    if camFollowToggle and camFollowToggle.Set then
+        pcall(function() camFollowToggle:Set(playback.camFollow) end)
+    end
+    if labelsToggle and labelsToggle.Set then
+        pcall(function() labelsToggle:Set(playback.showAllLabels) end)
+    end
     if config.autoPlay then
         setAutoPlaying(true)
     end
 
     pcall(function()
-        if Tabs and Tabs.Playback and Tabs.Playback.Select then
-            Tabs.Playback:Select()
-        end
+        if Tabs and Tabs.Playback then Tabs.Playback:Select() end
     end)
 
     refreshPlaybackUI()
@@ -1140,7 +1169,7 @@ local function startPlayback(config)
         or "No steps found in the instructions.", 5)
 end
 
-local function exitPlayback()
+exitPlayback = function()
     setAutoPlaying(false)
     playback.active = false
     updateSelectionVisuals()
@@ -1152,13 +1181,12 @@ local function exitPlayback()
 end
 
 -- ============================================================
---  ВВОД / INPUT
+--  INPUT
 -- ============================================================
 
 table.insert(Connections, UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed then return end
 
-    -- playback navigation
     if playback.active then
         if input.KeyCode == Enum.KeyCode.Left or input.KeyCode == Enum.KeyCode.LeftBracket then
             selectStep(currentIndex - 1)
@@ -1268,286 +1296,33 @@ table.insert(Connections, UserInputService.InputEnded:Connect(function(input)
 end))
 
 -- ============================================================
---  FLUENT UI
+--  HIDE / SHOW EDITOR
 -- ============================================================
 
-notify = function(title, content, dur)
-    pcall(function()
-        Fluent:Notify({ Title = title, Content = content, Duration = dur or 4 })
-    end)
-end
-
-pcall(function()
-    Fluent = loadstring(game:HttpGet("https://github.com/StyearX/Fluent-Modded/releases/download/1.6.0/main.lua"))()
-end)
-
-if not Fluent then
-    warn("[PlacementMap] Fluent failed to load — hotkeys + playback HUD still work.")
-end
-
--- sync flags (prevent Set() -> Callback() -> Set() loops)
-local labelSyncing, dropdownSyncing, autoSyncing, hiddenSyncing = false, false, false, false
-
-if Fluent then
-    Window = Fluent:CreateWindow({
-        Title = "Placement Map Builder",
-        SubTitle = "v5 • edit + playback",
-        TabWidth = 150,
-        Size = UDim2.fromOffset(580, 470),
-        Acrylic = false,
-        Theme = "Dark",
-    })
-
-    Tabs = {
-        Editor   = Window:AddTab({ Title = "Editor",   Icon = "map" }),
-        Playback = Window:AddTab({ Title = "Playback", Icon = "play" }),
-        Data     = Window:AddTab({ Title = "Data",     Icon = "file-text" }),
-        Settings = Window:AddTab({ Title = "Settings", Icon = "settings" }),
-    }
-
-    -- ================= EDITOR TAB =================
-    local secEdit = Tabs.Editor:AddSection("Step editing")
-
-    statusPara = secEdit:AddParagraph({ Title = "No steps", Content = "Press New Step to begin." })
-
-    labelInput = secEdit:AddInput("PMB_Label", {
-        Title = "Billboard text",
-        TextHint = "e.g. 'Sniper here'",
-        Default = "",
-        Finished = true,
-        Callback = function(v)
-            if labelSyncing then return end
-            local step = getCurrentStep()
-            if step then
-                step.BillboardText = v
-                if step.BB then step.BB.Label.Text = v end
-                if playback.active then refreshPlaybackUI() end
-            end
-        end,
-    })
-
-    secEdit:AddButton({ Title = "New Step", Icon = "plus", Description = "Adds an empty step", Callback = function()
-        local _, idx = createStep()
-        selectStep(idx)
-    end })
-
-    secEdit:AddButton({ Title = "Duplicate Step", Icon = "copy", Description = "Copies the current zone, offset to the side", Callback = function()
-        local step, idx = duplicateStep(currentIndex)
-        if step then selectStep(idx) end
-    end })
-
-    secEdit:AddButton({ Title = "◀  Previous step", Callback = function() selectStep(currentIndex - 1) end })
-    secEdit:AddButton({ Title = "Next step  ▶", Callback = function() selectStep(currentIndex + 1) end })
-
-    stepDropdown = secEdit:AddDropdown("PMB_StepSelect", {
-        Title = "Jump to step",
-        Values = { "-" },
-        Default = "-",
-        Callback = function(v)
-            if dropdownSyncing then return end
-            local n = tonumber(tostring(v):match("^(%d+)"))
-            if n then selectStep(n) end
-        end,
-    })
-
-    secEdit:AddDivider()
-
-    secEdit:AddButton({ Title = "Focus camera", Description = "Fly the camera to the current zone", Callback = function()
-        focusCameraOnStep(getCurrentStep(), false)
-    end })
-
-    secEdit:AddButton({ Title = "Reset rect", Description = "Detach the zone so you can redraw it", Callback = function()
+setEditorHidden = function(hidden)
+    editorHidden = hidden
+    cancelPointerActions()
+    hoveredStep = nil
+    for _, s in ipairs(Steps) do
+        clearGizmos(s)
+    end
+    visualFolder.Parent = hidden and nil or Workspace
+    if not hidden and not playback.active then
         local step = getCurrentStep()
-        if step then
-            destroyZone(step)
-            refreshUI()
+        if step and step.Part then
+            showGizmos(step)
         end
-    end })
-
-    visibilityToggle = secEdit:AddToggle("PMB_Visible", {
-        Title = "Zone visible",
-        Default = true,
-        Callback = function(v)
-            local step = getCurrentStep()
-            if not step or v == step.Visible then return end
-            step.Visible = v
-            step.Folder.Parent = v and visualFolder or nil
-            clearGizmos(step)
-            if v and not playback.active then showGizmos(step) end
-            refreshUI()
-        end,
-    })
-
-    secEdit:AddButton({ Title = "Delete step", Icon = "trash", Callback = function()
-        if getCurrentStep() then
-            removeStepAt(currentIndex)
-            selectStep(currentIndex)
-        end
-    end })
-
-    secEdit:AddColorpicker("PMB_Color", {
-        Title = "Zone color",
-        Default = PALETTE[1],
-        Callback = function(c)
-            local step = getCurrentStep()
-            if step then applyColor(step, c) end
-        end,
-    })
-
-    secEdit:AddButton({ Title = "▶  Preview as instructions", Description = "Plays your current steps in playback mode", Callback = function()
-        startPlayback({})
-    end })
-
-    secEdit:AddParagraph({
-        Title = "Hotkeys",
-        Content = "Drag ground = create • drag zone = move • handles = resize • ring = rotate\n[ ] = prev/next • Del = delete • Esc = cancel • H = hide visuals",
-    })
-
-    -- ================= PLAYBACK TAB =================
-    local secPlay = Tabs.Playback:AddSection("Instruction playback")
-
-    playbackPara = secPlay:AddParagraph({
-        Title = "Playback idle",
-        Content = "Load the library with an instruction table/string, or press 'Preview as instructions' in the Editor tab.",
-    })
-
-    secPlay:AddButton({ Title = "◀  Previous", Callback = function()
-        if playback.active then selectStep(currentIndex - 1) end
-    end })
-
-    secPlay:AddButton({ Title = "Next  ▶", Callback = function()
-        if playback.active then selectStep(currentIndex + 1) end
-    end })
-
-    autoplayToggle = secPlay:AddToggle("PMB_AutoPlay", {
-        Title = "Auto-play",
-        Description = "Advance steps automatically",
-        Default = false,
-        Callback = function(v)
-            if autoSyncing then return end
-            setAutoPlaying(v)
-        end,
-    })
-
-    camFollowToggle = secPlay:AddToggle("PMB_CamFollow", {
-        Title = "Camera follows steps",
-        Default = true,
-        Callback = function(v)
-            playback.camFollow = v
-            if v and playback.active then
-                focusCameraOnStep(getCurrentStep(), false)
-            end
-        end,
-    })
-
-    labelsToggle = secPlay:AddToggle("PMB_AllLabels", {
-        Title = "Show all step labels",
-        Default = true,
-        Callback = function(v)
-            playback.showAllLabels = v
-            updateSelectionVisuals()
-        end,
-    })
-
-    secPlay:AddSlider("PMB_StepTime", {
-        Title = "Seconds per step (auto-play)",
-        Min = 1, Max = 15, Default = 5, Rounding = 0,
-        Callback = function(v) playback.stepTime = v end,
-    })
-
-    secPlay:AddDivider()
-
-    secPlay:AddButton({ Title = "Teleport to current step", Description = "Moves your character above the zone", Callback = teleportToCurrentStep })
-
-    secPlay:AddButton({ Title = "Exit playback", Callback = function() exitPlayback() end })
-
-    secPlay:AddParagraph({
-        Title = "Hotkeys",
-        Content = "← → or [ ] = navigate • Space = auto-play on/off • H = hide visuals",
-    })
-
-    -- ================= DATA TAB =================
-    local secData = Tabs.Data:AddSection("Map data")
-
-    secData:AddParagraph({
-        Title = "Format",
-        Content = "Exported text is human-editable. Sections look like [Step 1] with text / color / position / size / rotation / visible keys. Lines starting with #, -- or // are comments. Import replaces all steps.",
-    })
-
-    secData:AddButton({ Title = "Export → open data window", Callback = function()
-        if dataBox then
-            dataBox.Text = exportData()
-            dataGui.Enabled = true
-        end
-        print("[PlacementMap] Export:\n" .. exportData())
-    end })
-
-    secData:AddButton({ Title = "Import ← data window", Callback = function()
-        if dataBox then
-            local ok, msg = importData(dataBox.Text)
-            if dataStatus then dataStatus.Text = tostring(msg) end
-            dataGui.Enabled = true
-            notify("Import", tostring(msg), 4)
-        end
-    end })
-
-    secData:AddButton({ Title = "Show / hide data window", Callback = function()
-        if dataGui then dataGui.Enabled = not dataGui.Enabled end
-    end })
-
-    -- ================= SETTINGS TAB =================
-    local secSet = Tabs.Settings:AddSection("Builder settings")
-
-    hiddenToggle = secSet:AddToggle("PMB_HideWorld", {
-        Title = "Hide world visuals (H)",
-        Default = false,
-        Callback = function(v)
-            if hiddenSyncing then return end
-            setEditorHidden(v)
-        end,
-    })
-
-    secSet:AddSlider("PMB_Grid", {
-        Title = "Grid snap (studs)",
-        Min = 0, Max = 10, Default = CONFIG.GridSnap, Rounding = 0,
-        Callback = function(v) CONFIG.GridSnap = v end,
-    })
-
-    secSet:AddSlider("PMB_Angle", {
-        Title = "Angle snap (degrees)",
-        Min = 0, Max = 45, Default = CONFIG.AngleSnapDeg, Rounding = 0,
-        Callback = function(v) CONFIG.AngleSnapDeg = v end,
-    })
-
-    secSet:AddSlider("PMB_BBDist", {
-        Title = "Label render distance",
-        Min = 40, Max = 500, Default = CONFIG.BillboardMaxDistance, Rounding = 0,
-        Callback = function(v)
-            CONFIG.BillboardMaxDistance = v
-            for _, s in ipairs(Steps) do
-                if s.BB then s.BB.GUI.MaxDistance = v end
-            end
-        end,
-    })
-
-    secSet:AddDivider()
-
-    secSet:AddButton({ Title = "Destroy builder", Description = "Removes everything this script created", Callback = function()
-        API.Destroy()
-    end })
+    end
+    hiddenSyncing = true
+    if hiddenToggle and type(hiddenToggle.Set) == "function" then
+        pcall(function() hiddenToggle:Set(hidden) end)
+    end
+    hiddenSyncing = false
 end
 
 -- ============================================================
---  РЕДАКТОР ДАННЫХ (custom multiline — Fluent has no multiline input)
+--  DATA EDITOR (custom multiline window — Fluent has no multiline input)
 -- ============================================================
-
-local function styleFrame(f)
-    Instance.new("UICorner", f).CornerRadius = UDim.new(0, 10)
-    local st = Instance.new("UIStroke")
-    st.Color = THEME.Border
-    st.Thickness = 1
-    st.Parent = f
-end
 
 dataGui = Instance.new("ScreenGui")
 dataGui.Name = "PMB_DataEditor"
@@ -1563,7 +1338,10 @@ dataFrame.BackgroundColor3 = THEME.Panel
 dataFrame.BackgroundTransparency = 0.05
 dataFrame.BorderSizePixel = 0
 dataFrame.Parent = dataGui
-styleFrame(dataFrame)
+Instance.new("UICorner", dataFrame).CornerRadius = UDim.new(0, 10)
+local dataStroke = Instance.new("UIStroke")
+dataStroke.Color = THEME.Border
+dataStroke.Parent = dataFrame
 
 local dataTitle = Instance.new("TextLabel")
 dataTitle.Position = UDim2.fromOffset(14, 10)
@@ -1607,9 +1385,9 @@ local dbPad = Instance.new("UIPadding", dataBox)
 dbPad.PaddingLeft = UDim.new(0, 8)
 dbPad.PaddingTop = UDim.new(0, 6)
 
-local function dButton(text, x, width, callback)
+local function dButton(text, x, callback)
     local b = Instance.new("TextButton")
-    b.Size = UDim2.new(0, width, 0, 30)
+    b.Size = UDim2.new(0, 122, 0, 30)
     b.Position = UDim2.fromOffset(x, 292)
     b.BackgroundColor3 = THEME.Button
     b.TextColor3 = THEME.Text
@@ -1622,18 +1400,18 @@ local function dButton(text, x, width, callback)
     b.MouseButton1Click:Connect(callback)
 end
 
-dButton("Export", 14, 122, function()
+dButton("Export", 14, function()
     dataBox.Text = exportData()
     dataStatus.Text = "Exported — also printed to Output. Select all (Ctrl+A) and copy."
 end)
 
-dButton("Import", 149, 122, function()
-    local ok, msg = importData(dataBox.Text)
+dButton("Import", 149, function()
+    local _, msg = importData(dataBox.Text)
     dataStatus.Text = tostring(msg)
     notify("Import", tostring(msg), 4)
 end)
 
-dButton("Close", 284, 122, function()
+dButton("Close", 284, function()
     dataGui.Enabled = false
 end)
 
@@ -1651,7 +1429,7 @@ dataStatus.TextXAlignment = Enum.TextXAlignment.Left
 dataStatus.Parent = dataFrame
 
 -- ============================================================
---  PLAYBACK HUD (works even without Fluent)
+--  PLAYBACK HUD (independent of Fluent)
 -- ============================================================
 
 hudGui = Instance.new("ScreenGui")
@@ -1674,7 +1452,7 @@ local hudStroke = Instance.new("UIStroke")
 hudStroke.Color = THEME.Border
 hudStroke.Parent = hud
 
-local hudTitle = Instance.new("TextLabel")
+hudTitle = Instance.new("TextLabel")
 hudTitle.Position = UDim2.fromOffset(14, 6)
 hudTitle.Size = UDim2.new(1, -28, 0, 18)
 hudTitle.BackgroundTransparency = 1
@@ -1685,7 +1463,7 @@ hudTitle.TextSize = 14
 hudTitle.TextXAlignment = Enum.TextXAlignment.Left
 hudTitle.Parent = hud
 
-local hudBody = Instance.new("TextLabel")
+hudBody = Instance.new("TextLabel")
 hudBody.Position = UDim2.fromOffset(14, 26)
 hudBody.Size = UDim2.new(1, -28, 0, 26)
 hudBody.BackgroundTransparency = 1
@@ -1699,27 +1477,189 @@ hudBody.TextXAlignment = Enum.TextXAlignment.Left
 hudBody.Parent = hud
 
 -- ============================================================
---  UI ↔ ЛОГИКА / REFRESH FUNCTIONS
+--  FALLBACK PANEL (only used if Fluent is completely unavailable)
 -- ============================================================
 
-setEditorHidden = function(hidden)
-    editorHidden = hidden
-    cancelPointerActions()
-    hoveredStep = nil
-    for _, s in ipairs(Steps) do
-        clearGizmos(s)
+buildFallbackPanel = function()
+    if fbRefs.Frame then return end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "PMB_FallbackPanel"
+    sg.ResetOnSpawn = false
+    sg.DisplayOrder = 45
+    sg.Parent = playerGui
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.fromOffset(250, 0)
+    frame.AutomaticSize = Enum.AutomaticSize.Y
+    frame.Position = UDim2.fromOffset(16, 16)
+    frame.BackgroundColor3 = THEME.Panel
+    frame.BackgroundTransparency = 0.05
+    frame.BorderSizePixel = 0
+    frame.Parent = sg
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+    local fst = Instance.new("UIStroke")
+    fst.Color = THEME.Border
+    fst.Parent = frame
+
+    local list = Instance.new("UIListLayout")
+    list.Padding = UDim.new(0, 6)
+    list.SortOrder = Enum.SortOrder.LayoutOrder
+    list.Parent = frame
+    local fpad = Instance.new("UIPadding")
+    fpad.PaddingTop = UDim.new(0, 10)
+    fpad.PaddingBottom = UDim.new(0, 10)
+    fpad.PaddingLeft = UDim.new(0, 10)
+    fpad.PaddingRight = UDim.new(0, 10)
+    fpad.Parent = frame
+
+    local function label(text, order, h)
+        local l = Instance.new("TextLabel")
+        l.Size = UDim2.new(1, 0, 0, h or 16)
+        l.BackgroundTransparency = 1
+        l.Text = text
+        l.TextColor3 = THEME.Muted
+        l.Font = Enum.Font.Gotham
+        l.TextSize = 12
+        l.TextXAlignment = Enum.TextXAlignment.Left
+        l.LayoutOrder = order
+        l.Parent = frame
+        return l
     end
-    visualFolder.Parent = hidden and nil or Workspace
-    if not hidden and not playback.active then
+
+    local function button(text, order, cb)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(1, 0, 0, 28)
+        b.BackgroundColor3 = THEME.Button
+        b.TextColor3 = THEME.Text
+        b.Font = Enum.Font.GothamMedium
+        b.TextSize = 13
+        b.Text = text
+        b.AutoButtonColor = true
+        b.LayoutOrder = order
+        b.Parent = frame
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
+        b.MouseButton1Click:Connect(cb)
+        return b
+    end
+
+    local function row(order)
+        local r = Instance.new("Frame")
+        r.Size = UDim2.new(1, 0, 0, 28)
+        r.BackgroundTransparency = 1
+        r.LayoutOrder = order
+        r.Parent = frame
+        local rl = Instance.new("UIListLayout")
+        rl.FillDirection = Enum.FillDirection.Horizontal
+        rl.Padding = UDim.new(0, 6)
+        rl.Parent = r
+        return r
+    end
+
+    local function halfBtn(parent, text, cb)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(0.5, -3, 1, 0)
+        b.BackgroundColor3 = THEME.Button
+        b.TextColor3 = THEME.Text
+        b.Font = Enum.Font.GothamMedium
+        b.TextSize = 13
+        b.Text = text
+        b.AutoButtonColor = true
+        b.Parent = parent
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
+        b.MouseButton1Click:Connect(cb)
+        return b
+    end
+
+    local ttl = label("Placement Map Builder", 0, 20)
+    ttl.Font = Enum.Font.GothamBold
+    ttl.TextSize = 15
+    ttl.TextColor3 = THEME.Text
+
+    fbRefs.Status = label("", 1, 40)
+    fbRefs.Status.TextWrapped = true
+    fbRefs.Status.TextYAlignment = Enum.TextYAlignment.Top
+
+    local nameBox = Instance.new("TextBox")
+    nameBox.Size = UDim2.new(1, 0, 0, 28)
+    nameBox.LayoutOrder = 2
+    nameBox.PlaceholderText = "Billboard text"
+    nameBox.PlaceholderColor3 = THEME.Muted
+    nameBox.Text = ""
+    nameBox.BackgroundColor3 = THEME.Panel2
+    nameBox.TextColor3 = THEME.Text
+    nameBox.Font = Enum.Font.Gotham
+    nameBox.TextSize = 13
+    nameBox.ClearTextOnFocus = false
+    nameBox.Parent = frame
+    Instance.new("UICorner", nameBox).CornerRadius = UDim.new(0, 8)
+    fbRefs.Name = nameBox
+    nameBox.FocusLost:Connect(function()
         local step = getCurrentStep()
-        if step and step.Part then
-            showGizmos(step)
+        if step then
+            step.BillboardText = nameBox.Text
+            if step.BB then step.BB.Label.Text = nameBox.Text end
         end
+    end)
+
+    button("＋  New Step", 3, function()
+        local _, i = createStep()
+        selectStep(i)
+    end)
+
+    button("Duplicate Step", 4, function()
+        local s, i = duplicateStep(currentIndex)
+        if s then selectStep(i) end
+    end)
+
+    local nav = row(5)
+    halfBtn(nav, "◀ Prev", function() selectStep(currentIndex - 1) end)
+    halfBtn(nav, "Next ▶", function() selectStep(currentIndex + 1) end)
+
+    local act = row(6)
+    halfBtn(act, "Delete", function()
+        if getCurrentStep() then
+            removeStepAt(currentIndex)
+            selectStep(currentIndex)
+        end
+    end)
+    halfBtn(act, "Hide (H)", function() setEditorHidden(not editorHidden) end)
+
+    button("▶  Preview as instructions", 7, function() startPlayback({}) end)
+    fbRefs.Auto = button("Auto-play: OFF", 8, function()
+        setAutoPlaying(not playback.autoPlaying)
+    end)
+    button("Teleport to step", 9, function() teleportToCurrentStep() end)
+    button("Export / Import", 10, function()
+        dataGui.Enabled = not dataGui.Enabled
+    end)
+
+    local colorRow = row(11)
+    for _, color in ipairs(PALETTE) do
+        local sw = Instance.new("TextButton")
+        sw.Size = UDim2.new(0.2, -5, 1, 0)
+        sw.BackgroundColor3 = color
+        sw.Text = ""
+        sw.AutoButtonColor = true
+        sw.Parent = colorRow
+        Instance.new("UICorner", sw).CornerRadius = UDim.new(0, 8)
+        sw.MouseButton1Click:Connect(function()
+            local step = getCurrentStep()
+            if step then
+                applyColor(step, color)
+                refreshUI()
+            end
+        end)
     end
-    hiddenSyncing = true
-    pcall(function() if hiddenToggle and hiddenToggle.Set then hiddenToggle:Set(hidden) end end)
-    hiddenSyncing = false
+
+    local note = label("Emergency panel (Fluent unavailable). Hotkeys still work.", 12, 28)
+    note.TextWrapped = true
+    fbRefs.Frame = frame
 end
+
+-- ============================================================
+--  UI REFRESH
+-- ============================================================
 
 refreshUI = function()
     local step = getCurrentStep()
@@ -1735,12 +1675,28 @@ refreshUI = function()
             dims .. "\nLabel: " .. tostring(step.BillboardText))
 
         labelSyncing = true
-        pcall(function() if labelInput and labelInput.Set then labelInput:Set(tostring(step.BillboardText)) end end)
+        if labelInput and type(labelInput.Set) == "function" then
+            pcall(function() labelInput:Set(tostring(step.BillboardText)) end)
+        end
         labelSyncing = false
 
-        pcall(function() if visibilityToggle and visibilityToggle.Set then visibilityToggle:Set(step.Visible) end end)
+        if visibilityToggle and type(visibilityToggle.Set) == "function" then
+            pcall(function() visibilityToggle:Set(step.Visible) end)
+        end
+
+        if fbRefs.Status then
+            local fdims = step.Center and ("%.0f x %.0f"):format(step.Width, step.Length) or "not placed"
+            fbRefs.Status.Text = ("Step %d/%d — %s\n%s"):format(currentIndex, #Steps, step.Name, fdims)
+            if not fbRefs.Name:IsFocused() then
+                fbRefs.Name.Text = tostring(step.BillboardText)
+            end
+        end
     else
         setParagraph(statusPara, "No steps", "Press New Step to begin.")
+        if fbRefs.Status then
+            fbRefs.Status.Text = "No steps — press New Step"
+            fbRefs.Name.Text = ""
+        end
     end
 
     if stepDropdown then
@@ -1769,21 +1725,555 @@ refreshPlaybackUI = function()
     if not step then
         setParagraph(playbackPara, "Playback idle", "No steps available.")
         hud.Visible = false
+        if fbRefs.Auto then fbRefs.Auto.Text = "Auto-play: OFF" end
         return
     end
 
     local suffix = playback.autoPlaying and ("  ▶  auto (%.0fs/step)"):format(playback.stepTime) or ""
     local title = ("Step %d / %d — %s%s"):format(currentIndex, #Steps, step.Name, suffix)
-    local body = tostring(step.BillboardText)
+    local body = tostring(step.BillboardText or step.Name)
 
     setParagraph(playbackPara, title, body)
     hud.Visible = playback.active
     hudTitle.Text = title
     hudBody.Text = body
+
+    if fbRefs.Auto then
+        fbRefs.Auto.Text = playback.autoPlaying and "Auto-play: ON" or "Auto-play: OFF"
+    end
 end
 
 -- ============================================================
---  API + ИНИЦИАЛИЗАЦИЯ
+--  INITIALIZATION (before menu — editor works even if the menu fails)
+-- ============================================================
+
+do
+    local _, idx = createStep()
+    selectStep(idx)
+end
+
+-- ============================================================
+--  FLUENT MENU
+-- ============================================================
+
+destroyMenu = function()
+    if Window and type(Window.Destroy) == "function" then
+        pcall(function() Window:Destroy() end)
+    end
+    Window, Tabs = nil, nil
+end
+
+buildMenu = function()
+    destroyMenu()
+    menuStats.elements = 0
+    menuStats.errors = {}
+
+    if not Fluent then
+        local ok = pcall(function()
+            Fluent = loadstring(game:HttpGet(FLUENT_URL))()
+        end)
+        if not ok or type(Fluent) ~= "table" then
+            Fluent = nil
+            warn("[PMB] Fluent could not be loaded — switching to fallback panel")
+            return false
+        end
+    end
+
+    pcall(function() Fluent.NotifyInsideWindow = true end)
+
+    -- register a complete theme (the fork's AddTheme is the proven way to guarantee
+    -- every color key exists — no nil lookups during element creation)
+    pcall(function()
+        Fluent:AddTheme({
+            Name = "PMB Noir",
+            Accent = "#b4b4c3",
+            AcrylicMain = "#0c0c0e",
+            AcrylicBorder = "#28282d",
+            AcrylicGradient = ColorSequence.new({
+                ColorSequenceKeypoint.new(0,    Color3.fromHex("#0a0a0c")),
+                ColorSequenceKeypoint.new(0.33, Color3.fromHex("#121216")),
+                ColorSequenceKeypoint.new(0.66, Color3.fromHex("#16161c")),
+                ColorSequenceKeypoint.new(1,    Color3.fromHex("#19191e")),
+            }),
+            AcrylicNoise = 0.9,
+            TitleBarLine = "#50505f",
+            Tab = "#141417",
+            Element = "#121215",
+            ElementBorder = "#323237",
+            InElementBorder = "#232328",
+            ElementTransparency = 0.92,
+            ElementBorderThickness = 1,
+            ToggleSlider = "#37373c",
+            ToggleToggled = "#c8c8d7",
+            SliderRail = "#2d2d32",
+            CheckboxUnchecked = "#28282d",
+            CheckboxChecked = "#c8c8d7",
+            CheckboxCheck = "#0f0f12",
+            ProgressBarRail = "#232328",
+            ProgressBarFill = "#c8c8d7",
+            DropdownFrame = "#0f0f12",
+            DropdownHolder = "#141418",
+            DropdownBorder = "#323237",
+            DropdownOption = "#19191d",
+            DropdownBorderThickness = 1,
+            Keybind = "#1e1e22",
+            Input = "#141418",
+            InputFocused = "#1e1e23",
+            InputIndicator = "#b4b4c3",
+            Dialog = "#0e0e11",
+            DialogHolder = "#141418",
+            DialogHolderLine = "#323237",
+            DialogButton = "#32323a",
+            DialogButtonBorder = "#4b4b55",
+            DialogBorder = "#2d2d32",
+            DialogInput = "#16161a",
+            DialogInputLine = "#a0a0af",
+            Text = "#ebebf0",
+            SubText = "#8c8c94",
+            Hover = "#232328",
+            HoverChange = 0.06,
+            Background = "",
+            BackgroundTransparency = 1,
+            ViewportBackground = Color3.fromHex("#101014"),
+            ViewportBackgroundImages = false,
+            DropdownOutsideWindowBackground = Color3.fromHex("#0a0a0e"),
+            DropdownOutsideWindowBackgroundImages = false,
+            ShineEnabled = false,
+            StrokeShine = false,
+            StrokeDark = Color3.fromHex("#19191e"),
+            ButtonGradient = {
+                Background = ColorSequence.new({
+                    ColorSequenceKeypoint.new(0, Color3.fromHex("#2d2d34")),
+                    ColorSequenceKeypoint.new(1, Color3.fromHex("#19191e")),
+                }),
+                Stroke = ColorSequence.new({
+                    ColorSequenceKeypoint.new(0,   Color3.fromHex("#646473")),
+                    ColorSequenceKeypoint.new(0.5, Color3.fromHex("#41414b")),
+                    ColorSequenceKeypoint.new(1,   Color3.fromHex("#646473")),
+                }),
+            },
+            DiscordJoinButton = "#5865f2",
+            WarningNotifyColor = "#c8a028",
+            SuccessNotifyColor = "#3cb45a",
+            ErrorNotifyColor = "#c83232",
+            InfoNotifyColor = "#5096dc",
+        })
+    end)
+
+    local okW, errW = pcall(function()
+        Window = Fluent:CreateWindow({
+            Title = "Placement Map Builder",
+            SubTitle = "v5.1 — edit + playback",
+            TabWidth = 150,
+            Size = UDim2.fromOffset(580, 480),
+            Acrylic = false,
+            Theme = "PMB Noir",
+            Font = "GothamSSm",
+            FolderName = "PlacementMapBuilder",
+            ScreenGuiName = "PlacementMapBuilderUI",
+            Search = {
+                Search = true,
+                Highlight = true,
+                HighlightColor = Color3.fromRGB(160, 160, 175),
+            },
+        })
+    end)
+    if not okW or not Window then
+        warn("[PMB] CreateWindow failed: " .. tostring(errW))
+        Window = nil
+        return false
+    end
+
+    local tabObjects = {}
+    local function addTab(name, cfg)
+        local ok, tab = pcall(function() return Window:AddTab(cfg) end)
+        if ok and tab then
+            tabObjects[name] = tab
+        else
+            warn("[PMB] AddTab failed: " .. name .. " | " .. tostring(tab))
+        end
+    end
+
+    addTab("Editor",   { Title = "Editor",   Icon = "image" })
+    addTab("Playback", { Title = "Playback", Icon = "circle-dot" })
+    addTab("Data",     { Title = "Data",     Icon = "info" })
+    addTab("Settings", { Title = "Settings", Icon = "settings" })
+    Tabs = tabObjects
+
+    local secCount = { Editor = 0, Playback = 0, Data = 0, Settings = 0 }
+
+    local function safeAdd(label, fn)
+        local ok, res = pcall(fn)
+        if ok then
+            menuStats.elements += 1
+            return res
+        end
+        table.insert(menuStats.errors, ("%s -> %s"):format(label, tostring(res)))
+        warn("[PMB] element failed: " .. label .. " | " .. tostring(res))
+        return nil
+    end
+
+    local function addSection(tabName, title, icon)
+        local tab = tabObjects[tabName]
+        if not tab then return nil end
+        local sec = safeAdd(tabName .. "/section '" .. title .. "'", function()
+            return tab:AddSection(title, icon)
+        end)
+        if sec then
+            secCount[tabName] += 1
+        end
+        return sec
+    end
+
+    -- ================= EDITOR =================
+    local secEdit = addSection("Editor", "Step editing", "solar/gauge-bold")
+    if secEdit then
+        statusPara = safeAdd("Editor/status", function()
+            return secEdit:AddParagraph({ Title = "No steps", Content = "Press New Step to begin." })
+        end)
+
+        labelInput = safeAdd("Editor/labelInput", function()
+            return secEdit:AddInput("PMB_Label", {
+                Title = "Billboard text",
+                Placeholder = "e.g. 'Sniper here'",
+                TextHint = "e.g. 'Sniper here'",
+                Default = "",
+                Finished = true,
+                Callback = function(v)
+                    if labelSyncing then return end
+                    local step = getCurrentStep()
+                    if step then
+                        step.BillboardText = v
+                        if step.BB then step.BB.Label.Text = v end
+                        if playback.active then refreshPlaybackUI() end
+                    end
+                end,
+            })
+        end)
+
+        safeAdd("Editor/newStep", function()
+            return secEdit:AddButton({ Title = "New Step", Description = "Adds an empty step", Callback = function()
+                local _, idx = createStep()
+                selectStep(idx)
+            end })
+        end)
+
+        safeAdd("Editor/duplicate", function()
+            return secEdit:AddButton({ Title = "Duplicate Step", Description = "Copies the current zone, offset to the side", Callback = function()
+                local s, i = duplicateStep(currentIndex)
+                if s then selectStep(i) end
+            end })
+        end)
+
+        safeAdd("Editor/prev", function()
+            return secEdit:AddButton({ Title = "◀  Previous step", Callback = function()
+                selectStep(currentIndex - 1)
+            end })
+        end)
+
+        safeAdd("Editor/next", function()
+            return secEdit:AddButton({ Title = "Next step  ▶", Callback = function()
+                selectStep(currentIndex + 1)
+            end })
+        end)
+
+        stepDropdown = safeAdd("Editor/stepDropdown", function()
+            return secEdit:AddDropdown("PMB_StepSelect", {
+                Title = "Jump to step",
+                Values = { "-" },
+                Default = "-",
+                ThemedDropdown = true,
+                Callback = function(v)
+                    if dropdownSyncing then return end
+                    local n = tonumber(tostring(v):match("^(%d+)"))
+                    if n then selectStep(n) end
+                end,
+            })
+        end)
+
+        safeAdd("Editor/divider", function() return secEdit:AddDivider() end)
+
+        safeAdd("Editor/focus", function()
+            return secEdit:AddButton({ Title = "Focus camera", Description = "Fly the camera to the current zone", Callback = function()
+                focusCameraOnStep(getCurrentStep(), false)
+            end })
+        end)
+
+        safeAdd("Editor/resetRect", function()
+            return secEdit:AddButton({ Title = "Reset rect", Description = "Detach the zone so you can redraw it", Callback = function()
+                local step = getCurrentStep()
+                if step then
+                    destroyZone(step)
+                    refreshUI()
+                end
+            end })
+        end)
+
+        visibilityToggle = safeAdd("Editor/visibleToggle", function()
+            return secEdit:AddToggle("PMB_Visible", {
+                Title = "Zone visible",
+                Default = true,
+                Callback = function(v)
+                    local step = getCurrentStep()
+                    if not step or v == step.Visible then return end
+                    step.Visible = v
+                    step.Folder.Parent = v and visualFolder or nil
+                    clearGizmos(step)
+                    if v and not playback.active then showGizmos(step) end
+                    refreshUI()
+                end,
+            })
+        end)
+
+        safeAdd("Editor/delete", function()
+            return secEdit:AddButton({ Title = "Delete step", Callback = function()
+                if getCurrentStep() then
+                    removeStepAt(currentIndex)
+                    selectStep(currentIndex)
+                end
+            end })
+        end)
+
+        safeAdd("Editor/colorpicker", function()
+            return secEdit:AddColorpicker("PMB_Color", {
+                Title = "Zone color",
+                Default = PALETTE[1],
+                Callback = function(c)
+                    local step = getCurrentStep()
+                    if step then applyColor(step, c) end
+                end,
+            })
+        end)
+
+        safeAdd("Editor/preview", function()
+            return secEdit:AddButton({ Title = "▶  Preview as instructions", Description = "Plays your current steps in playback mode", Callback = function()
+                startPlayback({})
+            end })
+        end)
+
+        safeAdd("Editor/hotkeys", function()
+            return secEdit:AddParagraph({
+                Title = "Hotkeys",
+                Content = "Drag ground = create • drag zone = move • handles = resize • ring = rotate (45° snap)\n[ ] = prev/next • Del = delete • Esc = cancel • H = hide visuals",
+            })
+        end)
+    end
+
+    -- ================= PLAYBACK =================
+    local secPlay = addSection("Playback", "Instruction playback", "solar/toggle-on-circle-bold")
+    if secPlay then
+        playbackPara = safeAdd("Playback/status", function()
+            return secPlay:AddParagraph({
+                Title = "Playback idle",
+                Content = "Load the library with an instruction table/string, or press 'Preview as instructions' in the Editor tab.",
+            })
+        end)
+
+        safeAdd("Playback/prev", function()
+            return secPlay:AddButton({ Title = "◀  Previous", Callback = function()
+                if playback.active then selectStep(currentIndex - 1) end
+            end })
+        end)
+
+        safeAdd("Playback/next", function()
+            return secPlay:AddButton({ Title = "Next  ▶", Callback = function()
+                if playback.active then selectStep(currentIndex + 1) end
+            end })
+        end)
+
+        autoplayToggle = safeAdd("Playback/autoplay", function()
+            return secPlay:AddToggle("PMB_AutoPlay", {
+                Title = "Auto-play",
+                Description = "Advance steps automatically",
+                Default = false,
+                Callback = function(v)
+                    if autoSyncing then return end
+                    setAutoPlaying(v)
+                end,
+            })
+        end)
+
+        camFollowToggle = safeAdd("Playback/camFollow", function()
+            return secPlay:AddToggle("PMB_CamFollow", {
+                Title = "Camera follows steps",
+                Default = true,
+                Callback = function(v)
+                    playback.camFollow = v
+                    if v and playback.active then
+                        focusCameraOnStep(getCurrentStep(), false)
+                    end
+                end,
+            })
+        end)
+
+        labelsToggle = safeAdd("Playback/allLabels", function()
+            return secPlay:AddToggle("PMB_AllLabels", {
+                Title = "Show all step labels",
+                Default = true,
+                Callback = function(v)
+                    playback.showAllLabels = v
+                    updateSelectionVisuals()
+                end,
+            })
+        end)
+
+        safeAdd("Playback/stepTime", function()
+            return secPlay:AddSlider("PMB_StepTime", {
+                Title = "Seconds per step (auto-play)",
+                Min = 1, Max = 15, Default = playback.stepTime, Rounding = 0,
+                Callback = function(v) playback.stepTime = v end,
+            })
+        end)
+
+        safeAdd("Playback/divider", function() return secPlay:AddDivider() end)
+
+        safeAdd("Playback/teleport", function()
+            return secPlay:AddButton({ Title = "Teleport to current step", Callback = function()
+                teleportToCurrentStep()
+            end })
+        end)
+
+        safeAdd("Playback/exit", function()
+            return secPlay:AddButton({ Title = "Exit playback", Callback = function()
+                exitPlayback()
+            end })
+        end)
+
+        safeAdd("Playback/hotkeys", function()
+            return secPlay:AddParagraph({
+                Title = "Hotkeys",
+                Content = "← → or [ ] = navigate • Space = auto-play on/off • H = hide visuals",
+            })
+        end)
+    end
+
+    -- ================= DATA =================
+    local secData = addSection("Data", "Map data", "lucide/star")
+    if secData then
+        safeAdd("Data/format", function()
+            return secData:AddParagraph({
+                Title = "Format",
+                Content = "Sections look like [Step 1] with text / color / position / size / rotation / visible keys. Lines starting with #, -- or // are comments. Import replaces all steps.",
+            })
+        end)
+
+        safeAdd("Data/export", function()
+            return secData:AddButton({ Title = "Export → open data window", Callback = function()
+                if dataBox then
+                    dataBox.Text = exportData()
+                    dataGui.Enabled = true
+                end
+                print("[PMB] Export:\n" .. exportData())
+            end })
+        end)
+
+        safeAdd("Data/import", function()
+            return secData:AddButton({ Title = "Import ← data window", Callback = function()
+                if dataBox then
+                    local _, msg = importData(dataBox.Text)
+                    dataStatus.Text = tostring(msg)
+                    dataGui.Enabled = true
+                    notify("Import", tostring(msg), 4)
+                end
+            end })
+        end)
+
+        safeAdd("Data/toggle", function()
+            return secData:AddButton({ Title = "Show / hide data window", Callback = function()
+                dataGui.Enabled = not dataGui.Enabled
+            end })
+        end)
+    end
+
+    -- ================= SETTINGS =================
+    local secSet = addSection("Settings", "Builder settings", "solar/cursor-bold")
+    if secSet then
+        hiddenToggle = safeAdd("Settings/hide", function()
+            return secSet:AddToggle("PMB_HideWorld", {
+                Title = "Hide world visuals (H)",
+                Default = false,
+                Callback = function(v)
+                    if hiddenSyncing then return end
+                    setEditorHidden(v)
+                end,
+            })
+        end)
+
+        safeAdd("Settings/grid", function()
+            return secSet:AddSlider("PMB_Grid", {
+                Title = "Grid snap (studs)",
+                Min = 0, Max = 10, Default = CONFIG.GridSnap, Rounding = 0,
+                Callback = function(v) CONFIG.GridSnap = v end,
+            })
+        end)
+
+        safeAdd("Settings/angle", function()
+            return secSet:AddSlider("PMB_Angle", {
+                Title = "Rotation snap (degrees)",
+                Min = 0, Max = 90, Default = CONFIG.AngleSnapDeg, Rounding = 0,
+                Callback = function(v) CONFIG.AngleSnapDeg = v end,
+            })
+        end)
+
+        safeAdd("Settings/bbDist", function()
+            return secSet:AddSlider("PMB_BBDist", {
+                Title = "Label render distance",
+                Min = 40, Max = 500, Default = CONFIG.BillboardMaxDistance, Rounding = 0,
+                Callback = function(v)
+                    CONFIG.BillboardMaxDistance = v
+                    for _, s in ipairs(Steps) do
+                        if s.BB then s.BB.GUI.MaxDistance = v end
+                    end
+                end,
+            })
+        end)
+
+        safeAdd("Settings/divider", function() return secSet:AddDivider() end)
+
+        safeAdd("Settings/rebuild", function()
+            return secSet:AddButton({ Title = "Rebuild menu", Description = "Re-runs the Fluent UI builder (use if tabs look broken)", Callback = function()
+                API.RebuildMenu()
+            end })
+        end)
+
+        safeAdd("Settings/destroy", function()
+            return secSet:AddButton({ Title = "Destroy builder", Description = "Removes everything this script created", Callback = function()
+                API.Destroy()
+            end })
+        end)
+    end
+
+    -- custom empty-state text on any tab that ended up empty
+    for name, tab in pairs(tabObjects) do
+        if secCount[name] == 0 then
+            pcall(function()
+                tab:SetEmptyState({
+                    Text = "Section failed to load",
+                    SubText = "Press F9 and look for [PMB] lines, then use Settings > Rebuild menu",
+                    Icon = "lucide/face-angry",
+                })
+            end)
+        end
+    end
+
+    print(("[PMB] Menu built — %d elements, %d errors"):format(menuStats.elements, #menuStats.errors))
+    return true
+end
+
+-- build the menu; fall back to the emergency panel if Fluent is hopeless
+do
+    local ok = buildMenu()
+    if not ok then
+        buildFallbackPanel()
+    elseif menuStats.elements == 0 then
+        warn("[PMB] Fluent window built but zero elements loaded — switching to fallback panel")
+        destroyMenu()
+        buildFallbackPanel()
+    end
+end
+
+-- ============================================================
+--  API
 -- ============================================================
 
 function API.Play(config)
@@ -1821,26 +2311,38 @@ function API.Preview()
     startPlayback({})
 end
 
+function API.RebuildMenu()
+    if buildMenu() then
+        notify("Menu", ("Rebuilt — %d elements"):format(menuStats.elements), 3)
+        if menuStats.elements == 0 then
+            destroyMenu()
+            buildFallbackPanel()
+        end
+    else
+        buildFallbackPanel()
+        notify("Menu", "Fluent unavailable — fallback panel active", 4)
+    end
+end
+
 function API.Destroy()
-    setAutoPlaying(false)
+    if playback.thread then
+        pcall(task.cancel, playback.thread)
+    end
     playback.active = false
     for _, c in ipairs(Connections) do
         pcall(function() c:Disconnect() end)
     end
     table.clear(Connections)
+    destroyMenu()
     pcall(function() if visualFolder then visualFolder:Destroy() end end)
     pcall(function() if dataGui then dataGui:Destroy() end end)
     pcall(function() if hudGui then hudGui:Destroy() end end)
-    pcall(function() if Window and Window.Destroy then Window:Destroy() end end)
+    if fbRefs.Frame and fbRefs.Frame.Parent then
+        fbRefs.Frame.Parent:Destroy()
+    end
     if GBridge.__PMB == API then
         GBridge.__PMB = nil
     end
-end
-
--- first step so edit mode is instantly usable
-do
-    local _, idx = createStep()
-    selectStep(idx)
 end
 
 setmetatable(API, {
