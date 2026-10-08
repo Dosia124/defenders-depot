@@ -1,24 +1,48 @@
 --[[
     ============================================================
-    PLACEMENT MAP BUILDER v4
+    PLACEMENT MAP BUILDER v5 — LIBRARY EDITION
     ============================================================
-    LocalScript в StarterPlayerScripts. Без внешних библиотек.
+    Load with loadstring. The file RETURNS an API table:
 
-    Управление в мире:
-      - ЛКМ-тяни по пустой земле (у шага нет зоны) — создать зону
-        (простой клик = зона 4x4)
-      - ЛКМ по зоне + тяни — двигать (шаг выбирается автоматически)
-      - Ручки на краях — растягивать (ручки висят НАД зоной)
-      - Кольцо — вращать вокруг Y
-      - [ и ] — предыдущий / следующий шаг
-      - Delete — удалить шаг, Esc — отменить создание
-      - H — спрятать/показать редактор целиком
-      - Номера в панели — быстрый выбор шага
+        local PMB = loadstring(game:HttpGet("YOUR_RAW_URL_HERE"))()
 
-    Визуал «тихий»: невыбранная зона — тонкие уголки + маленький
-    номер; текст и заливка проявляются при наведении/выборе.
+    ► EDIT MODE (no arguments):
+        PMB()                -- opens the builder, draw zones in the world
 
-    Export / Import — простой текстовый формат (см. exportData).
+    ► INSTRUCTION MODE (step-by-step playback):
+        PMB({
+            autoPlay      = false,   -- start playing immediately
+            stepTime      = 5,       -- seconds per step (auto-play)
+            camFollow     = true,    -- camera flies to each step
+            showAllLabels = true,    -- show every billboard text
+            loop          = true,    -- auto-play wraps around
+            append        = false,   -- true = keep existing steps
+
+            -- EITHER raw exported text:
+            data = "# PLACEMENT MAP\n[Step 1]\ntext = Sniper here\n...",
+
+            -- OR a clean table:
+            steps = {
+                { name = "Step 1", text = "Sniper here",
+                  position = Vector3.new(12.5, 0, -30), -- or {12.5, 0, -30} or "12.5, 0, -30"
+                  size = {8, 6}, rotation = 45,
+                  color = {86, 214, 145},               -- or "56D691" or Color3
+                  visible = true },
+            },
+        })
+
+        -- a plain string works too:
+        PMB("exported map text")
+
+    ► PROGRAMMATIC:
+        PMB:Edit()      -- force edit mode
+        PMB:Play(cfg)   -- force playback
+        PMB:Preview()   -- playback of the steps you built in edit mode
+        PMB:Destroy()   -- full cleanup
+
+    Hotkeys (playback):  ← → or [ ] navigate • Space = auto-play • H = hide visuals
+    Hotkeys (edit):      drag = create/move • handles = resize • ring = rotate
+                         [ ] steps • Del = delete • Esc = cancel • H = hide
     ============================================================
 ]]
 
@@ -30,30 +54,37 @@ local Workspace = game:GetService("Workspace")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
+-- double-load guard: destroy the previous instance if re-executed
+local GBridge = (typeof(getgenv) == "function") and getgenv() or _G
+if GBridge.__PMB and type(GBridge.__PMB.Destroy) == "function" then
+    pcall(GBridge.__PMB.Destroy)
+    GBridge.__PMB = nil
+end
+
+local API = {}
+
 -- ============================================================
---  НАСТРОЙКИ
+--  НАСТРОЙКИ / CONFIG
 -- ============================================================
 
 local CONFIG = {
-    GridSnap = 1,              -- шаг сетки в студах (0 = выключить)
-    AngleSnapDeg = 5,          -- шаг поворота в градусах (0 = выключить)
+    GridSnap = 1,
+    AngleSnapDeg = 5,
     MinSize = 1,
-    DefaultSize = 4,           -- размер при простом клике
+    DefaultSize = 4,
     ZoneThickness = 0.2,
 
-    -- --- визуал ---
-    FillIdle = 0.95,            -- заливка обычной зоны (1 = полностью выключить)
-    FillSelected = 0.75,        -- заливка выбранной/наведённой
-    CornerLength = 0.25,        -- длина уголка (доля стороны зоны)
-    CornerThickness = 3,        -- толщина линий уголков, px
-    OutlineTransparency = 0.7,  -- едва заметная обводка всего контура
+    FillIdle = 0.95,
+    FillSelected = 0.75,
+    CornerLength = 0.25,
+    CornerThickness = 3,
+    OutlineTransparency = 0.7,
 
-    BillboardHeight = 2.5,      -- метка чуть над землёй
-    BillboardMaxDistance = 120, -- дальше этого метки скрываются
-    BadgeSize = 34,             -- размер кружка с номером
+    BillboardHeight = 2.5,
+    BillboardMaxDistance = 120,
+    BadgeSize = 34,
 
-    GizmoOffset = 2,            -- насколько ручки выше зоны (студы)
-
+    GizmoOffset = 2,
     MaxRayDistance = 2000,
 }
 
@@ -77,7 +108,6 @@ local THEME = {
     Dark = Color3.fromRGB(18, 20, 25),
 }
 
--- локальные оси граней Handles (Front = -Z, Back = +Z)
 local FACE_AXIS = {
     [Enum.NormalId.Right] = Vector3.new(1, 0, 0),
     [Enum.NormalId.Left]  = Vector3.new(-1, 0, 0),
@@ -86,13 +116,25 @@ local FACE_AXIS = {
 }
 
 -- ============================================================
---  СОСТОЯНИЕ
+--  СОСТОЯНИЕ / STATE
 -- ============================================================
+
+local playback = {
+    active = false,
+    autoPlaying = false,
+    stepTime = 5,
+    camFollow = true,
+    showAllLabels = true,
+    loop = true,
+    thread = nil,
+    config = nil,
+}
 
 local Steps = {}
 local currentIndex = 0
 local nextStepId = 1
 local PartToStep = {}
+local Connections = {}
 
 local visualFolder = Instance.new("Folder")
 visualFolder.Name = "PlacementMap_Visuals"
@@ -107,18 +149,20 @@ local gizmoDragging = false
 local hoveredStep = nil
 local editorHidden = false
 
-local refreshUI
-local selectStep
-local setEditorHidden
+-- forward declarations
+local refreshUI, selectStep, setEditorHidden, refreshPlaybackUI, focusCameraOnStep
+local notify
+local Fluent, Window, Tabs
+local statusPara, playbackPara, labelInput, stepDropdown
+local autoplayToggle, camFollowToggle, labelsToggle, visibilityToggle, hiddenToggle
+local dataGui, dataBox, dataStatus, hudGui
 
 -- ============================================================
---  УТИЛИТЫ
+--  УТИЛИТЫ / UTILITIES
 -- ============================================================
 
 local function snap(value, increment)
-    if not increment or increment <= 0 then
-        return value
-    end
+    if not increment or increment <= 0 then return value end
     return math.round(value / increment) * increment
 end
 
@@ -134,6 +178,15 @@ end
 
 local function getCurrentStep()
     return Steps[currentIndex]
+end
+
+local function setParagraph(p, title, content)
+    if not p then return end
+    pcall(function()
+        if p.SetTitle then p:SetTitle(title) end
+        if p.SetDesc then p:SetDesc(content)
+        elseif p.SetContent then p:SetContent(content) end
+    end)
 end
 
 -- ============================================================
@@ -183,10 +236,9 @@ local function raycastZone()
 end
 
 -- ============================================================
---  ВИЗУАЛЫ: уголки зоны (SurfaceGui) и метка (Billboard)
+--  ВИЗУАЛЫ: уголки + метка
 -- ============================================================
 
--- тонкие уголки по периметру + еле заметная обводка; масштабируется вместе с партом
 local function createBorder(part, color)
     local gui = Instance.new("SurfaceGui")
     gui.Name = "Border"
@@ -202,7 +254,6 @@ local function createBorder(part, color)
     root.BackgroundTransparency = 1
     root.Parent = gui
 
-    -- тонкая обводка всего контура, чтобы форма зоны была видна целиком
     local outline = Instance.new("Frame")
     outline.Size = UDim2.fromScale(1, 1)
     outline.BackgroundTransparency = 1
@@ -214,7 +265,6 @@ local function createBorder(part, color)
     outlineStroke.Transparency = CONFIG.OutlineTransparency
     outlineStroke.Parent = outline
 
-    -- 8 планок = 4 уголка
     local bars = {}
     local function addBar(x, y, anchor, horizontal)
         local bar = Instance.new("Frame")
@@ -244,7 +294,6 @@ local function createBorder(part, color)
     }
 end
 
--- метка = маленький кружок с номером; текст раскрывается при наведении/выборе
 local function createBillboard(position, text, color, parent)
     local anchor = Instance.new("Part")
     anchor.Name = "BillboardAnchor"
@@ -290,7 +339,6 @@ local function createBillboard(position, text, color, parent)
     bpad.PaddingTop = UDim.new(0, 6)
     bpad.PaddingBottom = UDim.new(0, 6)
 
-    -- текстовая пилюля (скрыта по умолчанию)
     local pill = Instance.new("Frame")
     pill.AnchorPoint = Vector2.new(0, 0.5)
     pill.Position = UDim2.new(1, 8, 0.5, 0)
@@ -317,13 +365,8 @@ local function createBillboard(position, text, color, parent)
     lpad.PaddingRight = UDim.new(0, 12)
 
     return {
-        Anchor = anchor,
-        GUI = gui,
-        Label = label,
-        Badge = badge,
-        BadgeText = badgeText,
-        Pill = pill,
-        Stroke = stroke,
+        Anchor = anchor, GUI = gui, Label = label,
+        Badge = badge, BadgeText = badgeText, Pill = pill, Stroke = stroke,
     }
 end
 
@@ -337,7 +380,6 @@ local function applyTransform(step)
     part.Size = Vector3.new(step.Width, CONFIG.ZoneThickness, step.Length)
     part.CFrame = CFrame.new(step.Center) * CFrame.Angles(0, step.RotationY, 0)
 
-    -- подложка гизмо едет вместе с зоной
     if step.GizmoPart then
         step.GizmoPart.Size = part.Size
         step.GizmoPart.CFrame = part.CFrame * CFrame.new(0, CONFIG.GizmoOffset, 0)
@@ -371,11 +413,10 @@ local function updateSelectionVisuals()
         local active = selected or (step == hoveredStep)
 
         if step.Part then
-            tween(step.Part, 0.15, {
-                Transparency = active and CONFIG.FillSelected or CONFIG.FillIdle,
-            })
+            local idle = playback.active and 0.86 or CONFIG.FillIdle
+            tween(step.Part, 0.15, { Transparency = active and CONFIG.FillSelected or idle })
             if step.Border then
-                step.Border.SetTransparency(active and 0 or 0.3)
+                step.Border.SetTransparency(active and 0 or (playback.active and 0.15 or 0.3))
             end
             if step.Highlight then
                 step.Highlight.Enabled = selected
@@ -383,7 +424,7 @@ local function updateSelectionVisuals()
             setPulse(step, selected)
         end
         if step.BB then
-            step.BB.Pill.Visible = active
+            step.BB.Pill.Visible = active or (playback.active and playback.showAllLabels)
             step.BB.BadgeText.Text = tostring(i)
             step.BB.Badge.BackgroundTransparency = active and 0.1 or 0.4
             step.BB.Stroke.Thickness = selected and 2 or 1
@@ -408,7 +449,39 @@ local function applyColor(step, color)
 end
 
 -- ============================================================
---  ПРЕВЬЮ ПРИ СОЗДАНИИ (+ живой размер)
+--  КАМЕРА / ТЕЛЕПОРТ
+-- ============================================================
+
+focusCameraOnStep = function(step, instant)
+    if not (step and step.Center) then return end
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+
+    local radius = math.max(step.Width, step.Length)
+    local dist = math.clamp(radius * 1.4 + 16, 18, 120)
+    local offset = Vector3.new(dist * 0.45, dist * 0.75, dist * 0.55)
+    local target = CFrame.lookAt(step.Center + offset, step.Center)
+
+    if instant then
+        cam.CFrame = target
+        return
+    end
+    TweenService:Create(cam, TweenInfo.new(0.9, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), { CFrame = target }):Play()
+end
+
+local function teleportToCurrentStep()
+    local step = getCurrentStep()
+    if not (step and step.Center) then return end
+    local char = player.Character
+    local hrp = char and (char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart)
+    if hrp then
+        hrp.CFrame = CFrame.new(step.Center + Vector3.new(0, 5, 0))
+        notify("Teleport", ("Moved to step %d"):format(currentIndex), 3)
+    end
+end
+
+-- ============================================================
+--  ПРЕВЬЮ ПРИ СОЗДАНИИ
 -- ============================================================
 
 local previewPart, previewHighlight, previewBorder, previewLabel
@@ -485,9 +558,6 @@ end
 
 -- ============================================================
 --  ГИЗМО
---  Ручки живут на невидимой подложке GizmoOffset студов выше зоны.
---  MouseDrag отдаёт значение ОТ НАЧАЛА перетаскивания —
---  поэтому исходное состояние запоминаем на MouseButton1Down.
 -- ============================================================
 
 local function clearGizmos(step)
@@ -514,8 +584,8 @@ end
 
 local function showGizmos(step)
     if not step.Part or not step.Visible or step.Handles then return end
+    if playback.active then return end -- no editing handles during playback
 
-    -- невидимая подложка: ручки висят над зоной, а не на ней
     local gizmoPart = Instance.new("Part")
     gizmoPart.Name = "GizmoAnchor"
     gizmoPart.Size = step.Part.Size
@@ -629,7 +699,7 @@ local function createZonePart(step)
     highlight.FillTransparency = 0.85
     highlight.OutlineTransparency = 0
     highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-    highlight.Enabled = false -- только у выбранной (лимит Highlight)
+    highlight.Enabled = false
     highlight.Parent = part
 
     step.Part = part
@@ -658,7 +728,7 @@ local function destroyZone(step)
 end
 
 -- ============================================================
---  ШАГИ
+--  ШАГИ / STEPS
 -- ============================================================
 
 local function createStep(name, color, text)
@@ -710,6 +780,30 @@ local function removeStepAt(index)
     table.remove(Steps, index)
 end
 
+local function duplicateStep(index)
+    local src = Steps[index]
+    if not src then return nil end
+    local step = createStep(src.Name .. " copy", src.Color, src.BillboardText)
+    step.Width, step.Length = src.Width, src.Length
+    step.RotationY = src.RotationY
+    step.Visible = src.Visible
+    if src.Center then
+        step.Center = src.Center + Vector3.new(step.Width + 1, 0, 0)
+        createZonePart(step)
+        if not step.Visible then
+            step.Folder.Parent = nil
+        end
+    end
+    return step, #Steps
+end
+
+local function clearAllSteps()
+    for i = #Steps, 1, -1 do
+        removeStepAt(i)
+    end
+    currentIndex = 0
+end
+
 selectStep = function(index)
     for _, s in ipairs(Steps) do
         clearGizmos(s)
@@ -718,23 +812,20 @@ selectStep = function(index)
     currentIndex = (#Steps > 0) and math.clamp(index, 1, #Steps) or 0
 
     local step = getCurrentStep()
-    if step and step.Part then
+    if step and step.Part and step.Visible and not playback.active then
         showGizmos(step)
     end
+
+    if playback.active and playback.camFollow and step then
+        focusCameraOnStep(step, false)
+    end
+
     updateSelectionVisuals()
     refreshUI()
 end
 
 -- ============================================================
---  ЭКСПОРТ / ИМПОРТ — простой текстовый формат
---
---      [Step 1]
---      text     = Sniper here
---      color    = 0, 255, 140
---      position = 12.5, 0.1, -30
---      size     = 8 x 6
---      rotation = 45
---      visible  = true
+--  ЭКСПОРТ / ИМПОРТ
 -- ============================================================
 
 local function fmt(n)
@@ -751,8 +842,8 @@ end
 local function exportData()
     local lines = {
         "# PLACEMENT MAP",
-        "# Правь значения как угодно и жми Import. Строки, начинающиеся с #, -- или //, — комментарии.",
-        "# position = X, Y, Z     size = ширина x длина     rotation = градусы     color = R, G, B  (или #RRGGBB)",
+        "# Edit values freely and press Import. Lines starting with #, -- or // are comments.",
+        "# position = X, Y, Z     size = width x length     rotation = degrees     color = R, G, B (or #RRGGBB)",
         "",
     }
 
@@ -801,6 +892,38 @@ local function parseBool(str)
     return nil
 end
 
+-- tolerant converters for the config-table API
+local function toColor3(c)
+    if typeof(c) == "Color3" then return c end
+    if type(c) == "string" then return parseColor(c) end
+    if type(c) == "table" then
+        if c.R then return Color3.new(c.R, c.G, c.B) end
+        if #c >= 3 then
+            if (c[1] > 1 or c[2] > 1 or c[3] > 1) then
+                return Color3.fromRGB(c[1], c[2], c[3])
+            end
+            return Color3.new(c[1], c[2], c[3])
+        end
+    end
+    return nil
+end
+
+local function toVector3(v)
+    if typeof(v) == "Vector3" then return v end
+    if type(v) == "table" then
+        local x = v.X or v.x or v[1]
+        local y = v.Y or v.y or v[2] or 0
+        local z = v.Z or v.z or v[3]
+        if x and z then return Vector3.new(x, y, z) end
+        return nil
+    end
+    if type(v) == "string" then
+        local n = parseNumbers(v)
+        if #n >= 3 then return Vector3.new(n[1], n[2], n[3]) end
+    end
+    return nil
+end
+
 local function parseMap(text)
     local entries, warnings = {}, {}
     local current
@@ -812,7 +935,7 @@ local function parseMap(text)
         local c1, c2 = line:sub(1, 1), line:sub(1, 2)
 
         if line == "" or c1 == "#" or c2 == "--" or c2 == "//" then
-            -- пропускаем
+            -- skip
         else
             local section = line:match("^%[(.-)%]$")
             if section then
@@ -821,9 +944,9 @@ local function parseMap(text)
             else
                 local key, value = line:match("^([%a_]+)%s*[=:]%s*(.-)$")
                 if not key then
-                    table.insert(warnings, ("строка %d: не понял «%s»"):format(lineNo, line))
+                    table.insert(warnings, ("line %d: could not parse '%s'"):format(lineNo, line))
                 elseif not current then
-                    table.insert(warnings, ("строка %d: значение вне секции [Step]"):format(lineNo, line))
+                    table.insert(warnings, ("line %d: value outside a [Step] section"):format(lineNo))
                 else
                     key = key:lower()
                     if key == "name" then
@@ -833,14 +956,14 @@ local function parseMap(text)
                     elseif key == "color" or key == "colour" then
                         local col = parseColor(value)
                         if col then current.color = col else
-                            table.insert(warnings, ("строка %d: плохой цвет «%s»"):format(lineNo, value))
+                            table.insert(warnings, ("line %d: bad color '%s'"):format(lineNo, value))
                         end
                     elseif key == "position" or key == "pos" then
                         local n = parseNumbers(value)
                         if #n >= 3 then
                             current.center = Vector3.new(n[1], n[2], n[3])
                         else
-                            table.insert(warnings, ("строка %d: position нужно 3 числа"):format(lineNo))
+                            table.insert(warnings, ("line %d: position needs 3 numbers"):format(lineNo))
                         end
                     elseif key == "size" then
                         local n = parseNumbers(value)
@@ -848,20 +971,20 @@ local function parseMap(text)
                             current.width = n[1]
                             current.length = n[2] or n[1]
                         else
-                            table.insert(warnings, ("строка %d: плохой size"):format(lineNo))
+                            table.insert(warnings, ("line %d: bad size"):format(lineNo))
                         end
                     elseif key == "rotation" or key == "rot" or key == "angle" then
                         local n = parseNumbers(value)
                         if #n >= 1 then current.rotation = n[1] else
-                            table.insert(warnings, ("строка %d: плохой rotation"):format(lineNo))
+                            table.insert(warnings, ("line %d: bad rotation"):format(lineNo))
                         end
                     elseif key == "visible" or key == "show" then
                         local b = parseBool(value)
                         if b ~= nil then current.visible = b else
-                            table.insert(warnings, ("строка %d: visible = true/false"):format(lineNo))
+                            table.insert(warnings, ("line %d: visible = true/false"):format(lineNo))
                         end
                     else
-                        table.insert(warnings, ("строка %d: неизвестный ключ «%s»"):format(lineNo, key))
+                        table.insert(warnings, ("line %d: unknown key '%s'"):format(lineNo, key))
                     end
                 end
             end
@@ -874,13 +997,10 @@ end
 local function importData(text)
     local entries, warnings = parseMap(text)
     if #entries == 0 then
-        return false, "Не найдено ни одной секции [Step]"
+        return false, "No [Step] sections found"
     end
 
-    for i = #Steps, 1, -1 do
-        removeStepAt(i)
-    end
-    currentIndex = 0
+    clearAllSteps()
 
     for _, e in ipairs(entries) do
         local name = (e.name ~= "") and e.name or nil
@@ -901,19 +1021,157 @@ local function importData(text)
 
     selectStep(1)
 
-    local msg = ("Загружено шагов: %d"):format(#entries)
+    local msg = ("Loaded %d steps"):format(#entries)
     if #warnings > 0 then
-        msg ..= (" • предупреждений: %d (%s)"):format(#warnings, warnings[1])
+        msg ..= (" • %d warnings (%s)"):format(#warnings, warnings[1])
     end
     return true, msg
 end
 
+-- build steps from a clean Lua table (instruction API)
+local function buildFromStepTable(list)
+    for _, e in ipairs(list) do
+        local name = e.name or e.title
+        local color = toColor3(e.color)
+        local text = e.text or e.label or name
+        local step = createStep(name, color, text)
+
+        local pos = toVector3(e.position or e.pos or e.center)
+        if pos then
+            local size = e.size
+            if type(size) == "table" then
+                step.Width = math.max(tonumber(size[1] or size.Width or size.x) or CONFIG.DefaultSize, CONFIG.MinSize)
+                step.Length = math.max(tonumber(size[2] or size.Length or size.z or size[1]) or CONFIG.DefaultSize, CONFIG.MinSize)
+            elseif type(size) == "number" then
+                step.Width, step.Length = size, size
+            end
+            step.RotationY = math.rad(tonumber(e.rotation or e.rot or e.angle) or 0)
+            step.Center = pos
+            createZonePart(step)
+        end
+
+        step.Visible = (e.visible ~= false)
+        if not step.Visible then
+            step.Folder.Parent = nil
+        end
+    end
+end
+
 -- ============================================================
---  ВВОД
+--  РЕЖИН ИНСТРУКЦИЙ / PLAYBACK ENGINE
 -- ============================================================
 
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
+local function setAutoPlaying(on)
+    playback.autoPlaying = on
+    if playback.thread then
+        pcall(task.cancel, playback.thread)
+        playback.thread = nil
+    end
+    if on and playback.active and #Steps > 0 then
+        playback.thread = task.spawn(function()
+            while playback.active and playback.autoPlaying do
+                for _ = 1, math.max(1, math.floor(playback.stepTime * 10)) do
+                    if not (playback.active and playback.autoPlaying) then return end
+                    task.wait(0.1)
+                end
+                local nextIdx = currentIndex + 1
+                if nextIdx > #Steps then
+                    if playback.loop == false then
+                        playback.autoPlaying = false
+                        playback.thread = nil
+                        pcall(function()
+                            if autoplayToggle and autoplayToggle.Set then autoplayToggle:Set(false) end
+                        end)
+                        refreshPlaybackUI()
+                        return
+                    end
+                    nextIdx = 1
+                end
+                selectStep(nextIdx)
+            end
+        end)
+    end
+    if playback.active then
+        refreshPlaybackUI()
+    end
+end
+
+local function startPlayback(config)
+    config = config or {}
+    setAutoPlaying(false)
+
+    playback.active = true
+    playback.config = config
+    playback.stepTime = tonumber(config.stepTime) or 5
+    playback.camFollow = config.camFollow ~= false
+    playback.showAllLabels = config.showAllLabels ~= false
+    playback.loop = config.loop ~= false
+
+    cancelPointerActions()
+    for _, s in ipairs(Steps) do
+        clearGizmos(s)
+    end
+
+    if #Steps > 0 then
+        currentIndex = 1
+        updateSelectionVisuals()
+        if playback.camFollow then
+            focusCameraOnStep(getCurrentStep(), true)
+        end
+    end
+
+    -- sync UI
+    pcall(function() if autoplayToggle and autoplayToggle.Set then autoplayToggle:Set(config.autoPlay == true) end end)
+    pcall(function() if camFollowToggle and camFollowToggle.Set then camFollowToggle:Set(playback.camFollow) end end)
+    pcall(function() if labelsToggle and labelsToggle.Set then labelsToggle:Set(playback.showAllLabels) end end)
+    if config.autoPlay then
+        setAutoPlaying(true)
+    end
+
+    pcall(function()
+        if Tabs and Tabs.Playback and Tabs.Playback.Select then
+            Tabs.Playback:Select()
+        end
+    end)
+
+    refreshPlaybackUI()
+    notify("Instruction mode",
+        (#Steps > 0) and ("Loaded %d steps. Arrows / [ ] navigate • Space = auto-play."):format(#Steps)
+        or "No steps found in the instructions.", 5)
+end
+
+local function exitPlayback()
+    setAutoPlaying(false)
+    playback.active = false
+    updateSelectionVisuals()
+    local step = getCurrentStep()
+    if step and step.Part and step.Visible then
+        showGizmos(step)
+    end
+    refreshUI()
+end
+
+-- ============================================================
+--  ВВОД / INPUT
+-- ============================================================
+
+table.insert(Connections, UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed then return end
+
+    -- playback navigation
+    if playback.active then
+        if input.KeyCode == Enum.KeyCode.Left or input.KeyCode == Enum.KeyCode.LeftBracket then
+            selectStep(currentIndex - 1)
+        elseif input.KeyCode == Enum.KeyCode.Right or input.KeyCode == Enum.KeyCode.RightBracket then
+            selectStep(currentIndex + 1)
+        elseif input.KeyCode == Enum.KeyCode.Space then
+            setAutoPlaying(not playback.autoPlaying)
+        elseif input.KeyCode == Enum.KeyCode.H then
+            setEditorHidden(not editorHidden)
+        end
+        return
+    end
+
     if editorHidden and input.KeyCode ~= Enum.KeyCode.H then return end
 
     if input.UserInputType == Enum.UserInputType.MouseButton1 then
@@ -955,11 +1213,11 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
     elseif input.KeyCode == Enum.KeyCode.Escape then
         cancelPointerActions()
     end
-end)
+end))
 
-UserInputService.InputChanged:Connect(function(input)
+table.insert(Connections, UserInputService.InputChanged:Connect(function(input)
     if input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
-    if editorHidden then return end
+    if editorHidden or playback.active then return end
 
     if placing and placeStart then
         local pos = raycastGround()
@@ -976,17 +1234,17 @@ UserInputService.InputChanged:Connect(function(input)
             applyTransform(dragStep)
         end
     elseif not gizmoDragging then
-        -- подсветка зоны под курсором
         local zoneStep = raycastZone()
         if zoneStep ~= hoveredStep then
             hoveredStep = zoneStep
             updateSelectionVisuals()
         end
     end
-end)
+end))
 
-UserInputService.InputEnded:Connect(function(input)
+table.insert(Connections, UserInputService.InputEnded:Connect(function(input)
     if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+    if playback.active then return end
 
     if placing then
         local step = getCurrentStep()
@@ -1007,34 +1265,281 @@ UserInputService.InputEnded:Connect(function(input)
     end
 
     gizmoDragging = false
+end))
+
+-- ============================================================
+--  FLUENT UI
+-- ============================================================
+
+notify = function(title, content, dur)
+    pcall(function()
+        Fluent:Notify({ Title = title, Content = content, Duration = dur or 4 })
+    end)
+end
+
+pcall(function()
+    Fluent = loadstring(game:HttpGet("https://github.com/StyearX/Fluent-Modded/releases/download/1.6.0/main.lua"))()
 end)
 
--- ============================================================
---  UI
--- ============================================================
-
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "PlacementMapBuilderUI"
-screenGui.ResetOnSpawn = false
-screenGui.Parent = playerGui
-
--- H: спрятать/показать весь редактор (визуал + панель + гизмо)
-setEditorHidden = function(hidden)
-    editorHidden = hidden
-    cancelPointerActions()
-    hoveredStep = nil
-    for _, s in ipairs(Steps) do
-        clearGizmos(s)
-    end
-    visualFolder.Parent = hidden and nil or Workspace
-    screenGui.Enabled = not hidden
-    if not hidden then
-        local step = getCurrentStep()
-        if step and step.Part then
-            showGizmos(step)
-        end
-    end
+if not Fluent then
+    warn("[PlacementMap] Fluent failed to load — hotkeys + playback HUD still work.")
 end
+
+-- sync flags (prevent Set() -> Callback() -> Set() loops)
+local labelSyncing, dropdownSyncing, autoSyncing, hiddenSyncing = false, false, false, false
+
+if Fluent then
+    Window = Fluent:CreateWindow({
+        Title = "Placement Map Builder",
+        SubTitle = "v5 • edit + playback",
+        TabWidth = 150,
+        Size = UDim2.fromOffset(580, 470),
+        Acrylic = false,
+        Theme = "Dark",
+    })
+
+    Tabs = {
+        Editor   = Window:AddTab({ Title = "Editor",   Icon = "map" }),
+        Playback = Window:AddTab({ Title = "Playback", Icon = "play" }),
+        Data     = Window:AddTab({ Title = "Data",     Icon = "file-text" }),
+        Settings = Window:AddTab({ Title = "Settings", Icon = "settings" }),
+    }
+
+    -- ================= EDITOR TAB =================
+    local secEdit = Tabs.Editor:AddSection("Step editing")
+
+    statusPara = secEdit:AddParagraph({ Title = "No steps", Content = "Press New Step to begin." })
+
+    labelInput = secEdit:AddInput("PMB_Label", {
+        Title = "Billboard text",
+        TextHint = "e.g. 'Sniper here'",
+        Default = "",
+        Finished = true,
+        Callback = function(v)
+            if labelSyncing then return end
+            local step = getCurrentStep()
+            if step then
+                step.BillboardText = v
+                if step.BB then step.BB.Label.Text = v end
+                if playback.active then refreshPlaybackUI() end
+            end
+        end,
+    })
+
+    secEdit:AddButton({ Title = "New Step", Icon = "plus", Description = "Adds an empty step", Callback = function()
+        local _, idx = createStep()
+        selectStep(idx)
+    end })
+
+    secEdit:AddButton({ Title = "Duplicate Step", Icon = "copy", Description = "Copies the current zone, offset to the side", Callback = function()
+        local step, idx = duplicateStep(currentIndex)
+        if step then selectStep(idx) end
+    end })
+
+    secEdit:AddButton({ Title = "◀  Previous step", Callback = function() selectStep(currentIndex - 1) end })
+    secEdit:AddButton({ Title = "Next step  ▶", Callback = function() selectStep(currentIndex + 1) end })
+
+    stepDropdown = secEdit:AddDropdown("PMB_StepSelect", {
+        Title = "Jump to step",
+        Values = { "-" },
+        Default = "-",
+        Callback = function(v)
+            if dropdownSyncing then return end
+            local n = tonumber(tostring(v):match("^(%d+)"))
+            if n then selectStep(n) end
+        end,
+    })
+
+    secEdit:AddDivider()
+
+    secEdit:AddButton({ Title = "Focus camera", Description = "Fly the camera to the current zone", Callback = function()
+        focusCameraOnStep(getCurrentStep(), false)
+    end })
+
+    secEdit:AddButton({ Title = "Reset rect", Description = "Detach the zone so you can redraw it", Callback = function()
+        local step = getCurrentStep()
+        if step then
+            destroyZone(step)
+            refreshUI()
+        end
+    end })
+
+    visibilityToggle = secEdit:AddToggle("PMB_Visible", {
+        Title = "Zone visible",
+        Default = true,
+        Callback = function(v)
+            local step = getCurrentStep()
+            if not step or v == step.Visible then return end
+            step.Visible = v
+            step.Folder.Parent = v and visualFolder or nil
+            clearGizmos(step)
+            if v and not playback.active then showGizmos(step) end
+            refreshUI()
+        end,
+    })
+
+    secEdit:AddButton({ Title = "Delete step", Icon = "trash", Callback = function()
+        if getCurrentStep() then
+            removeStepAt(currentIndex)
+            selectStep(currentIndex)
+        end
+    end })
+
+    secEdit:AddColorpicker("PMB_Color", {
+        Title = "Zone color",
+        Default = PALETTE[1],
+        Callback = function(c)
+            local step = getCurrentStep()
+            if step then applyColor(step, c) end
+        end,
+    })
+
+    secEdit:AddButton({ Title = "▶  Preview as instructions", Description = "Plays your current steps in playback mode", Callback = function()
+        startPlayback({})
+    end })
+
+    secEdit:AddParagraph({
+        Title = "Hotkeys",
+        Content = "Drag ground = create • drag zone = move • handles = resize • ring = rotate\n[ ] = prev/next • Del = delete • Esc = cancel • H = hide visuals",
+    })
+
+    -- ================= PLAYBACK TAB =================
+    local secPlay = Tabs.Playback:AddSection("Instruction playback")
+
+    playbackPara = secPlay:AddParagraph({
+        Title = "Playback idle",
+        Content = "Load the library with an instruction table/string, or press 'Preview as instructions' in the Editor tab.",
+    })
+
+    secPlay:AddButton({ Title = "◀  Previous", Callback = function()
+        if playback.active then selectStep(currentIndex - 1) end
+    end })
+
+    secPlay:AddButton({ Title = "Next  ▶", Callback = function()
+        if playback.active then selectStep(currentIndex + 1) end
+    end })
+
+    autoplayToggle = secPlay:AddToggle("PMB_AutoPlay", {
+        Title = "Auto-play",
+        Description = "Advance steps automatically",
+        Default = false,
+        Callback = function(v)
+            if autoSyncing then return end
+            setAutoPlaying(v)
+        end,
+    })
+
+    camFollowToggle = secPlay:AddToggle("PMB_CamFollow", {
+        Title = "Camera follows steps",
+        Default = true,
+        Callback = function(v)
+            playback.camFollow = v
+            if v and playback.active then
+                focusCameraOnStep(getCurrentStep(), false)
+            end
+        end,
+    })
+
+    labelsToggle = secPlay:AddToggle("PMB_AllLabels", {
+        Title = "Show all step labels",
+        Default = true,
+        Callback = function(v)
+            playback.showAllLabels = v
+            updateSelectionVisuals()
+        end,
+    })
+
+    secPlay:AddSlider("PMB_StepTime", {
+        Title = "Seconds per step (auto-play)",
+        Min = 1, Max = 15, Default = 5, Rounding = 0,
+        Callback = function(v) playback.stepTime = v end,
+    })
+
+    secPlay:AddDivider()
+
+    secPlay:AddButton({ Title = "Teleport to current step", Description = "Moves your character above the zone", Callback = teleportToCurrentStep })
+
+    secPlay:AddButton({ Title = "Exit playback", Callback = function() exitPlayback() end })
+
+    secPlay:AddParagraph({
+        Title = "Hotkeys",
+        Content = "← → or [ ] = navigate • Space = auto-play on/off • H = hide visuals",
+    })
+
+    -- ================= DATA TAB =================
+    local secData = Tabs.Data:AddSection("Map data")
+
+    secData:AddParagraph({
+        Title = "Format",
+        Content = "Exported text is human-editable. Sections look like [Step 1] with text / color / position / size / rotation / visible keys. Lines starting with #, -- or // are comments. Import replaces all steps.",
+    })
+
+    secData:AddButton({ Title = "Export → open data window", Callback = function()
+        if dataBox then
+            dataBox.Text = exportData()
+            dataGui.Enabled = true
+        end
+        print("[PlacementMap] Export:\n" .. exportData())
+    end })
+
+    secData:AddButton({ Title = "Import ← data window", Callback = function()
+        if dataBox then
+            local ok, msg = importData(dataBox.Text)
+            if dataStatus then dataStatus.Text = tostring(msg) end
+            dataGui.Enabled = true
+            notify("Import", tostring(msg), 4)
+        end
+    end })
+
+    secData:AddButton({ Title = "Show / hide data window", Callback = function()
+        if dataGui then dataGui.Enabled = not dataGui.Enabled end
+    end })
+
+    -- ================= SETTINGS TAB =================
+    local secSet = Tabs.Settings:AddSection("Builder settings")
+
+    hiddenToggle = secSet:AddToggle("PMB_HideWorld", {
+        Title = "Hide world visuals (H)",
+        Default = false,
+        Callback = function(v)
+            if hiddenSyncing then return end
+            setEditorHidden(v)
+        end,
+    })
+
+    secSet:AddSlider("PMB_Grid", {
+        Title = "Grid snap (studs)",
+        Min = 0, Max = 10, Default = CONFIG.GridSnap, Rounding = 0,
+        Callback = function(v) CONFIG.GridSnap = v end,
+    })
+
+    secSet:AddSlider("PMB_Angle", {
+        Title = "Angle snap (degrees)",
+        Min = 0, Max = 45, Default = CONFIG.AngleSnapDeg, Rounding = 0,
+        Callback = function(v) CONFIG.AngleSnapDeg = v end,
+    })
+
+    secSet:AddSlider("PMB_BBDist", {
+        Title = "Label render distance",
+        Min = 40, Max = 500, Default = CONFIG.BillboardMaxDistance, Rounding = 0,
+        Callback = function(v)
+            CONFIG.BillboardMaxDistance = v
+            for _, s in ipairs(Steps) do
+                if s.BB then s.BB.GUI.MaxDistance = v end
+            end
+        end,
+    })
+
+    secSet:AddDivider()
+
+    secSet:AddButton({ Title = "Destroy builder", Description = "Removes everything this script created", Callback = function()
+        API.Destroy()
+    end })
+end
+
+-- ============================================================
+--  РЕДАКТОР ДАННЫХ (custom multiline — Fluent has no multiline input)
+-- ============================================================
 
 local function styleFrame(f)
     Instance.new("UICorner", f).CornerRadius = UDim.new(0, 10)
@@ -1044,183 +1549,36 @@ local function styleFrame(f)
     st.Parent = f
 end
 
-local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(270, 0)
-frame.AutomaticSize = Enum.AutomaticSize.Y
-frame.Position = UDim2.fromOffset(16, 16)
-frame.BackgroundColor3 = THEME.Panel
-frame.BackgroundTransparency = 0.05
-frame.BorderSizePixel = 0
-frame.Parent = screenGui
-styleFrame(frame)
-
-local layout = Instance.new("UIListLayout")
-layout.Padding = UDim.new(0, 8)
-layout.SortOrder = Enum.SortOrder.LayoutOrder
-layout.Parent = frame
-
-local padding = Instance.new("UIPadding")
-padding.PaddingTop = UDim.new(0, 12)
-padding.PaddingBottom = UDim.new(0, 12)
-padding.PaddingLeft = UDim.new(0, 12)
-padding.PaddingRight = UDim.new(0, 12)
-padding.Parent = frame
-
-local function makeLabel(text, order, height, parent)
-    local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(1, 0, 0, height or 20)
-    lbl.BackgroundTransparency = 1
-    lbl.Text = text
-    lbl.TextColor3 = THEME.Text
-    lbl.Font = Enum.Font.Gotham
-    lbl.TextSize = 13
-    lbl.TextXAlignment = Enum.TextXAlignment.Left
-    lbl.LayoutOrder = order or 0
-    lbl.Parent = parent or frame
-    return lbl
-end
-
--- variant: nil | "primary" | "danger"
-local function makeButton(text, order, parent, size, variant)
-    local base = (variant == "primary") and PALETTE[1] or THEME.Button
-    local hover = (variant == "primary") and PALETTE[1]:Lerp(Color3.new(1, 1, 1), 0.25)
-        or (variant == "danger") and THEME.Danger
-        or THEME.ButtonHover
-
-    local btn = Instance.new("TextButton")
-    btn.Size = size or UDim2.new(1, 0, 0, 32)
-    btn.BackgroundColor3 = base
-    btn.TextColor3 = (variant == "primary") and THEME.Dark or THEME.Text
-    btn.Font = Enum.Font.GothamMedium
-    btn.TextSize = 13
-    btn.Text = text
-    btn.AutoButtonColor = false
-    btn.LayoutOrder = order or 0
-    btn.Parent = parent or frame
-    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
-
-    btn.MouseEnter:Connect(function() tween(btn, 0.12, { BackgroundColor3 = hover }) end)
-    btn.MouseLeave:Connect(function() tween(btn, 0.12, { BackgroundColor3 = base }) end)
-    return btn
-end
-
-local function makeRow(order, height)
-    local row = Instance.new("Frame")
-    row.Size = UDim2.new(1, 0, 0, height)
-    row.BackgroundTransparency = 1
-    row.LayoutOrder = order
-    row.Parent = frame
-    local l = Instance.new("UIListLayout")
-    l.FillDirection = Enum.FillDirection.Horizontal
-    l.Padding = UDim.new(0, 6)
-    l.Parent = row
-    return row
-end
-
--- заголовок с акцентной полоской (цвет = цвет текущего шага)
-local header = Instance.new("Frame")
-header.Size = UDim2.new(1, 0, 0, 24)
-header.BackgroundTransparency = 1
-header.LayoutOrder = 1
-header.Parent = frame
-
-local accentBar = Instance.new("Frame")
-accentBar.Size = UDim2.fromOffset(4, 20)
-accentBar.Position = UDim2.fromOffset(0, 2)
-accentBar.BackgroundColor3 = PALETTE[1]
-accentBar.BorderSizePixel = 0
-accentBar.Parent = header
-Instance.new("UICorner", accentBar).CornerRadius = UDim.new(1, 0)
-
-local title = makeLabel("Placement Map Builder", 0, 24, header)
-title.Position = UDim2.fromOffset(14, 0)
-title.Size = UDim2.new(1, -14, 1, 0)
-title.Font = Enum.Font.GothamBold
-title.TextSize = 16
-
-local statusLabel = makeLabel("", 2, 34)
-statusLabel.TextWrapped = true
-statusLabel.TextColor3 = THEME.Muted
-statusLabel.TextYAlignment = Enum.TextYAlignment.Top
-
--- чипы шагов
-local chipsFrame = Instance.new("Frame")
-chipsFrame.Size = UDim2.new(1, 0, 0, 0)
-chipsFrame.AutomaticSize = Enum.AutomaticSize.Y
-chipsFrame.BackgroundTransparency = 1
-chipsFrame.LayoutOrder = 3
-chipsFrame.Parent = frame
-local chipsGrid = Instance.new("UIGridLayout")
-chipsGrid.CellSize = UDim2.fromOffset(30, 30)
-chipsGrid.CellPadding = UDim2.fromOffset(5, 5)
-chipsGrid.SortOrder = Enum.SortOrder.LayoutOrder
-chipsGrid.Parent = chipsFrame
-
-local nameBox = Instance.new("TextBox")
-nameBox.Size = UDim2.new(1, 0, 0, 32)
-nameBox.PlaceholderText = "Текст таблички (напр. 'Sniper here')"
-nameBox.PlaceholderColor3 = THEME.Muted
-nameBox.Text = ""
-nameBox.BackgroundColor3 = THEME.Panel2
-nameBox.TextColor3 = THEME.Text
-nameBox.Font = Enum.Font.Gotham
-nameBox.TextSize = 13
-nameBox.ClearTextOnFocus = false
-nameBox.LayoutOrder = 4
-nameBox.Parent = frame
-Instance.new("UICorner", nameBox).CornerRadius = UDim.new(0, 8)
-local nameStroke = Instance.new("UIStroke")
-nameStroke.Color = THEME.Border
-nameStroke.Parent = nameBox
-nameBox.Focused:Connect(function() tween(nameStroke, 0.15, { Color = PALETTE[1] }) end)
-nameBox.FocusLost:Connect(function() tween(nameStroke, 0.15, { Color = THEME.Border }) end)
-
-local newStepBtn = makeButton("＋  New Step", 5, nil, nil, "primary")
-
-local navRow = makeRow(6, 32)
-local half = UDim2.new(0.5, -3, 1, 0)
-local prevBtn = makeButton("◀  Prev", 0, navRow, half)
-local nextBtn = makeButton("Next  ▶", 0, navRow, half)
-
-local actionRow = makeRow(7, 32)
-local visibilityBtn = makeButton("Hide", 0, actionRow, half)
-local resetRectBtn = makeButton("Reset Rect", 0, actionRow, half)
-
-local deleteBtn = makeButton("Delete Step", 8, nil, nil, "danger")
-
-local colorRow = makeRow(9, 28)
-local dataBtn = makeButton("Export / Import", 10)
-
-local hint = makeLabel(
-    "Тяни по земле — создать зону\nКлик по зоне — двигать • ручки — размер\nКольцо — поворот • [ ] — шаги • Del — удалить\nH — спрятать редактор",
-    11, 62
-)
-hint.TextWrapped = true
-hint.TextYAlignment = Enum.TextYAlignment.Top
-hint.TextColor3 = THEME.Muted
-hint.TextSize = 11
-
--- --- панель данных ---
+dataGui = Instance.new("ScreenGui")
+dataGui.Name = "PMB_DataEditor"
+dataGui.ResetOnSpawn = false
+dataGui.DisplayOrder = 40
+dataGui.Enabled = false
+dataGui.Parent = playerGui
 
 local dataFrame = Instance.new("Frame")
-dataFrame.Size = UDim2.fromOffset(400, 380)
-dataFrame.Position = UDim2.fromOffset(300, 16)
+dataFrame.Size = UDim2.fromOffset(420, 400)
+dataFrame.Position = UDim2.new(0.5, -210, 0.5, -200)
 dataFrame.BackgroundColor3 = THEME.Panel
 dataFrame.BackgroundTransparency = 0.05
 dataFrame.BorderSizePixel = 0
-dataFrame.Visible = false
-dataFrame.Parent = screenGui
+dataFrame.Parent = dataGui
 styleFrame(dataFrame)
 
-local dataTitle = makeLabel("Export / Import", 0, 22, dataFrame)
+local dataTitle = Instance.new("TextLabel")
 dataTitle.Position = UDim2.fromOffset(14, 10)
 dataTitle.Size = UDim2.new(1, -28, 0, 22)
+dataTitle.BackgroundTransparency = 1
+dataTitle.Text = "Export / Import"
+dataTitle.TextColor3 = THEME.Text
 dataTitle.Font = Enum.Font.GothamBold
 dataTitle.TextSize = 15
+dataTitle.TextXAlignment = Enum.TextXAlignment.Left
+dataTitle.Parent = dataFrame
 
 local scroll = Instance.new("ScrollingFrame")
 scroll.Position = UDim2.fromOffset(14, 40)
-scroll.Size = UDim2.new(1, -28, 0, 250)
+scroll.Size = UDim2.new(1, -28, 0, 240)
 scroll.BackgroundColor3 = THEME.Panel2
 scroll.BorderSizePixel = 0
 scroll.ScrollBarThickness = 5
@@ -1229,8 +1587,8 @@ scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
 scroll.Parent = dataFrame
 Instance.new("UICorner", scroll).CornerRadius = UDim.new(0, 8)
 
-local dataBox = Instance.new("TextBox")
-dataBox.Size = UDim2.new(1, -8, 0, 250)
+dataBox = Instance.new("TextBox")
+dataBox.Size = UDim2.new(1, -8, 0, 240)
 dataBox.AutomaticSize = Enum.AutomaticSize.Y
 dataBox.BackgroundTransparency = 1
 dataBox.TextColor3 = THEME.Text
@@ -1241,7 +1599,7 @@ dataBox.TextWrapped = true
 dataBox.ClearTextOnFocus = false
 dataBox.TextXAlignment = Enum.TextXAlignment.Left
 dataBox.TextYAlignment = Enum.TextYAlignment.Top
-dataBox.PlaceholderText = "Нажми Export, чтобы получить текст карты,\nили вставь сюда свой и нажми Import"
+dataBox.PlaceholderText = "Press Export to get the map text,\nor paste your own and press Import"
 dataBox.PlaceholderColor3 = THEME.Muted
 dataBox.Text = ""
 dataBox.Parent = scroll
@@ -1249,169 +1607,255 @@ local dbPad = Instance.new("UIPadding", dataBox)
 dbPad.PaddingLeft = UDim.new(0, 8)
 dbPad.PaddingTop = UDim.new(0, 6)
 
-local exportBtn = makeButton("Export", 0, dataFrame, UDim2.new(0.5, -20, 0, 32), "primary")
-exportBtn.Position = UDim2.fromOffset(14, 300)
-local importBtn = makeButton("Import", 0, dataFrame, UDim2.new(0.5, -20, 0, 32))
-importBtn.Position = UDim2.fromOffset(0.5, 6, 0, 300)
+local function dButton(text, x, width, callback)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0, width, 0, 30)
+    b.Position = UDim2.fromOffset(x, 292)
+    b.BackgroundColor3 = THEME.Button
+    b.TextColor3 = THEME.Text
+    b.Font = Enum.Font.GothamMedium
+    b.TextSize = 13
+    b.Text = text
+    b.AutoButtonColor = true
+    b.Parent = dataFrame
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
+    b.MouseButton1Click:Connect(callback)
+end
 
-local dataStatus = makeLabel("", 0, 32, dataFrame)
-dataStatus.Position = UDim2.fromOffset(14, 340)
-dataStatus.Size = UDim2.new(1, -28, 0, 32)
+dButton("Export", 14, 122, function()
+    dataBox.Text = exportData()
+    dataStatus.Text = "Exported — also printed to Output. Select all (Ctrl+A) and copy."
+end)
+
+dButton("Import", 149, 122, function()
+    local ok, msg = importData(dataBox.Text)
+    dataStatus.Text = tostring(msg)
+    notify("Import", tostring(msg), 4)
+end)
+
+dButton("Close", 284, 122, function()
+    dataGui.Enabled = false
+end)
+
+dataStatus = Instance.new("TextLabel")
+dataStatus.Position = UDim2.fromOffset(14, 330)
+dataStatus.Size = UDim2.new(1, -28, 0, 56)
+dataStatus.BackgroundTransparency = 1
+dataStatus.Text = ""
 dataStatus.TextWrapped = true
 dataStatus.TextYAlignment = Enum.TextYAlignment.Top
 dataStatus.TextColor3 = THEME.Muted
+dataStatus.Font = Enum.Font.Gotham
 dataStatus.TextSize = 12
+dataStatus.TextXAlignment = Enum.TextXAlignment.Left
+dataStatus.Parent = dataFrame
 
 -- ============================================================
---  ПРИВЯЗКА UI К ЛОГИКЕ
+--  PLAYBACK HUD (works even without Fluent)
 -- ============================================================
 
-local lastChipSig = ""
+hudGui = Instance.new("ScreenGui")
+hudGui.Name = "PMB_PlaybackHUD"
+hudGui.ResetOnSpawn = false
+hudGui.DisplayOrder = 50
+hudGui.Parent = playerGui
 
-local function rebuildChips()
-    local parts = { tostring(currentIndex) }
+local hud = Instance.new("Frame")
+hud.AnchorPoint = Vector2.new(0.5, 0)
+hud.Position = UDim2.new(0.5, 0, 0, 12)
+hud.Size = UDim2.fromOffset(440, 58)
+hud.BackgroundColor3 = THEME.Panel
+hud.BackgroundTransparency = 0.12
+hud.BorderSizePixel = 0
+hud.Visible = false
+hud.Parent = hudGui
+Instance.new("UICorner", hud).CornerRadius = UDim.new(0, 12)
+local hudStroke = Instance.new("UIStroke")
+hudStroke.Color = THEME.Border
+hudStroke.Parent = hud
+
+local hudTitle = Instance.new("TextLabel")
+hudTitle.Position = UDim2.fromOffset(14, 6)
+hudTitle.Size = UDim2.new(1, -28, 0, 18)
+hudTitle.BackgroundTransparency = 1
+hudTitle.Text = "Playback"
+hudTitle.TextColor3 = THEME.Text
+hudTitle.Font = Enum.Font.GothamBold
+hudTitle.TextSize = 14
+hudTitle.TextXAlignment = Enum.TextXAlignment.Left
+hudTitle.Parent = hud
+
+local hudBody = Instance.new("TextLabel")
+hudBody.Position = UDim2.fromOffset(14, 26)
+hudBody.Size = UDim2.new(1, -28, 0, 26)
+hudBody.BackgroundTransparency = 1
+hudBody.Text = ""
+hudBody.TextColor3 = THEME.Muted
+hudBody.Font = Enum.Font.Gotham
+hudBody.TextSize = 13
+hudBody.TextWrapped = true
+hudBody.TextTruncate = Enum.TextTruncate.AtEnd
+hudBody.TextXAlignment = Enum.TextXAlignment.Left
+hudBody.Parent = hud
+
+-- ============================================================
+--  UI ↔ ЛОГИКА / REFRESH FUNCTIONS
+-- ============================================================
+
+setEditorHidden = function(hidden)
+    editorHidden = hidden
+    cancelPointerActions()
+    hoveredStep = nil
     for _, s in ipairs(Steps) do
-        table.insert(parts, ("%s%d%d"):format(s.Color:ToHex(), s.Visible and 1 or 0, s.Center and 1 or 0))
+        clearGizmos(s)
     end
-    local sig = table.concat(parts, "|")
-    if sig == lastChipSig then return end
-    lastChipSig = sig
-
-    for _, child in ipairs(chipsFrame:GetChildren()) do
-        if child:IsA("TextButton") then child:Destroy() end
-    end
-
-    for i, step in ipairs(Steps) do
-        local chip = Instance.new("TextButton")
-        chip.Text = tostring(i)
-        chip.LayoutOrder = i
-        chip.BackgroundColor3 = step.Color
-        chip.BackgroundTransparency = (not step.Visible) and 0.85 or (step.Center and 0 or 0.55)
-        chip.TextColor3 = THEME.Dark
-        chip.TextTransparency = (not step.Visible) and 0.5 or 0
-        chip.Font = Enum.Font.GothamBold
-        chip.TextSize = 14
-        chip.AutoButtonColor = true
-        chip.Parent = chipsFrame
-        Instance.new("UICorner", chip).CornerRadius = UDim.new(0, 8)
-
-        if i == currentIndex then
-            local st = Instance.new("UIStroke")
-            st.Color = Color3.new(1, 1, 1)
-            st.Thickness = 2
-            st.Parent = chip
+    visualFolder.Parent = hidden and nil or Workspace
+    if not hidden and not playback.active then
+        local step = getCurrentStep()
+        if step and step.Part then
+            showGizmos(step)
         end
-
-        chip.MouseButton1Click:Connect(function()
-            selectStep(i)
-        end)
     end
+    hiddenSyncing = true
+    pcall(function() if hiddenToggle and hiddenToggle.Set then hiddenToggle:Set(hidden) end end)
+    hiddenSyncing = false
 end
 
 refreshUI = function()
     local step = getCurrentStep()
     if step then
-        local dims = step.Center
-            and ("%.0f x %.0f  •  %d°"):format(step.Width, step.Length, math.floor(math.deg(step.RotationY) + 0.5) % 360)
-            or "не размещена — тяни по земле"
-        statusLabel.Text = ("Шаг %d из %d — %s\n%s"):format(currentIndex, #Steps, step.Name, dims)
-        if not nameBox:IsFocused() then
-            nameBox.Text = step.BillboardText
+        local dims
+        if step.Center then
+            dims = ("%.0f × %.0f  •  %d°"):format(step.Width, step.Length, math.floor(math.deg(step.RotationY) + 0.5) % 360)
+        else
+            dims = "not placed — drag on the ground to draw the zone"
         end
-        visibilityBtn.Text = step.Visible and "Hide" or "Show"
-        tween(accentBar, 0.2, { BackgroundColor3 = step.Color })
+        setParagraph(statusPara,
+            ("Step %d / %d — %s"):format(currentIndex, #Steps, step.Name),
+            dims .. "\nLabel: " .. tostring(step.BillboardText))
+
+        labelSyncing = true
+        pcall(function() if labelInput and labelInput.Set then labelInput:Set(tostring(step.BillboardText)) end end)
+        labelSyncing = false
+
+        pcall(function() if visibilityToggle and visibilityToggle.Set then visibilityToggle:Set(step.Visible) end end)
     else
-        statusLabel.Text = "Нет шагов — нажми New Step"
-        nameBox.Text = ""
+        setParagraph(statusPara, "No steps", "Press New Step to begin.")
     end
-    rebuildChips()
+
+    if stepDropdown then
+        dropdownSyncing = true
+        local values, current = { "-" }, "-"
+        if #Steps > 0 then
+            values = {}
+            for i, s in ipairs(Steps) do
+                values[i] = i .. ") " .. tostring(s.Name)
+            end
+            local cs = getCurrentStep()
+            if cs then current = currentIndex .. ") " .. cs.Name end
+        end
+        pcall(function() if stepDropdown.SetValues then stepDropdown:SetValues(values) end end)
+        pcall(function() if stepDropdown.Set then stepDropdown:Set(current) end end)
+        dropdownSyncing = false
+    end
+
+    if playback.active then
+        refreshPlaybackUI()
+    end
 end
 
-newStepBtn.MouseButton1Click:Connect(function()
-    local _, index = createStep()
-    selectStep(index)
-end)
-
-nameBox.FocusLost:Connect(function()
+refreshPlaybackUI = function()
     local step = getCurrentStep()
-    if step then
-        step.BillboardText = nameBox.Text
-        if step.BB then
-            step.BB.Label.Text = nameBox.Text
-        end
+    if not step then
+        setParagraph(playbackPara, "Playback idle", "No steps available.")
+        hud.Visible = false
+        return
     end
-end)
 
-prevBtn.MouseButton1Click:Connect(function()
-    selectStep(currentIndex - 1)
-end)
+    local suffix = playback.autoPlaying and ("  ▶  auto (%.0fs/step)"):format(playback.stepTime) or ""
+    local title = ("Step %d / %d — %s%s"):format(currentIndex, #Steps, step.Name, suffix)
+    local body = tostring(step.BillboardText)
 
-nextBtn.MouseButton1Click:Connect(function()
-    selectStep(currentIndex + 1)
-end)
-
-visibilityBtn.MouseButton1Click:Connect(function()
-    local step = getCurrentStep()
-    if not step then return end
-    step.Visible = not step.Visible
-    step.Folder.Parent = step.Visible and visualFolder or nil
-    clearGizmos(step)
-    if step.Visible then
-        showGizmos(step)
-    end
-    refreshUI()
-end)
-
-resetRectBtn.MouseButton1Click:Connect(function()
-    local step = getCurrentStep()
-    if not step then return end
-    destroyZone(step)
-    refreshUI()
-end)
-
-deleteBtn.MouseButton1Click:Connect(function()
-    if not getCurrentStep() then return end
-    removeStepAt(currentIndex)
-    selectStep(currentIndex)
-end)
-
-for _, color in ipairs(PALETTE) do
-    local swatch = Instance.new("TextButton")
-    swatch.Size = UDim2.new(0, 36, 1, 0)
-    swatch.BackgroundColor3 = color
-    swatch.Text = ""
-    swatch.AutoButtonColor = true
-    swatch.Parent = colorRow
-    Instance.new("UICorner", swatch).CornerRadius = UDim.new(0, 8)
-
-    swatch.MouseButton1Click:Connect(function()
-        local step = getCurrentStep()
-        if step then
-            applyColor(step, color)
-            refreshUI()
-        end
-    end)
+    setParagraph(playbackPara, title, body)
+    hud.Visible = playback.active
+    hudTitle.Text = title
+    hudBody.Text = body
 end
 
-dataBtn.MouseButton1Click:Connect(function()
-    dataFrame.Visible = not dataFrame.Visible
-end)
-
-exportBtn.MouseButton1Click:Connect(function()
-    local text = exportData()
-    dataBox.Text = text
-    print(text)
-    dataStatus.Text = "Готово. Выдели текст (Ctrl+A, Ctrl+C) — он также выведен в Output."
-end)
-
-importBtn.MouseButton1Click:Connect(function()
-    local _, msg = importData(dataBox.Text)
-    dataStatus.Text = msg
-end)
-
 -- ============================================================
---  ИНИЦИАЛИЗАЦИЯ
+--  API + ИНИЦИАЛИЗАЦИЯ
 -- ============================================================
 
-local _, firstIndex = createStep()
-selectStep(firstIndex)
+function API.Play(config)
+    config = config or {}
+    if config.data then
+        local ok, msg = importData(tostring(config.data))
+        if not ok then
+            notify("Playback", tostring(msg), 5)
+        end
+    elseif type(config.steps) == "table" then
+        if not config.append then
+            clearAllSteps()
+        end
+        buildFromStepTable(config.steps)
+        if #Steps > 0 then
+            selectStep(1)
+        end
+    end
+    startPlayback(config)
+end
+
+function API.Edit()
+    if playback.active then
+        exitPlayback()
+    elseif #Steps == 0 then
+        local _, idx = createStep()
+        selectStep(idx)
+    else
+        selectStep(currentIndex)
+    end
+    notify("Edit mode", "Drag on the ground to create zones. Use the window for controls.", 4)
+end
+
+function API.Preview()
+    startPlayback({})
+end
+
+function API.Destroy()
+    setAutoPlaying(false)
+    playback.active = false
+    for _, c in ipairs(Connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(Connections)
+    pcall(function() if visualFolder then visualFolder:Destroy() end end)
+    pcall(function() if dataGui then dataGui:Destroy() end end)
+    pcall(function() if hudGui then hudGui:Destroy() end end)
+    pcall(function() if Window and Window.Destroy then Window:Destroy() end end)
+    if GBridge.__PMB == API then
+        GBridge.__PMB = nil
+    end
+end
+
+-- first step so edit mode is instantly usable
+do
+    local _, idx = createStep()
+    selectStep(idx)
+end
+
+setmetatable(API, {
+    __call = function(_, arg)
+        if type(arg) == "table" then
+            return API.Play(arg)
+        elseif type(arg) == "string" then
+            return API.Play({ data = arg })
+        end
+        return API.Edit()
+    end,
+})
+
+GBridge.__PMB = API
+
+notify("Placement Map Builder", "Loaded — PMB() = edit mode • PMB(config) or PMB(text) = playback", 6)
+
+return API
